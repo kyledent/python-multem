@@ -631,9 +631,20 @@ namespace multem {
    * @returns The simulation results
    */
   Output simulate_with_ice_approximation(
-      SystemConfiguration config, 
-      Input input, 
+      SystemConfiguration config,
+      Input input,
       const Masker &masker);
+
+  /**
+   * Run the simulation with multi-region material GRF.
+   * Each region has its own shape (with boolean operations) and
+   * material GRF parameters, enabling composite geometries such as
+   * holey foils with ice.
+   */
+  Output simulate_with_multi_material(
+      SystemConfiguration config,
+      Input input,
+      const MultiRegionMasker &masker);
  
   /**
    * Run the simulation. This overload performs the simulation for a sample

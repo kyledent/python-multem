@@ -1290,6 +1290,36 @@ PYBIND11_MODULE(multem_ext, m)
     .def_readwrite("a1", &multem::IceParameters::a1)
     .def_readwrite("a2", &multem::IceParameters::a2)
     .def_readwrite("density", &multem::IceParameters::density)
+    .def_readwrite("m0", &multem::IceParameters::m0)
+    .def_readwrite("v0", &multem::IceParameters::v0)
+    ;
+
+  // Wrap the multem::MaskerRegion struct
+  py::class_<multem::MaskerRegion>(m, "MaskerRegion")
+    .def(py::init<>())
+    .def_readwrite("shape", &multem::MaskerRegion::shape)
+    .def_readwrite("material", &multem::MaskerRegion::material)
+    .def_readwrite("subtract_regions", &multem::MaskerRegion::subtract_regions)
+    ;
+
+  // Wrap the multem::MultiRegionMasker class
+  py::class_<multem::MultiRegionMasker>(m, "MultiRegionMasker")
+    .def(py::init<>())
+    .def(py::init<std::size_t, std::size_t, double>())
+    .def("add_region", &multem::MultiRegionMasker::add_region,
+         py::arg("shape"),
+         py::arg("material"),
+         py::arg("subtract_regions") = std::vector<int>())
+    .def("num_regions", &multem::MultiRegionMasker::num_regions)
+    .def("region", &multem::MultiRegionMasker::region)
+    .def("xsize", &multem::MultiRegionMasker::xsize)
+    .def("ysize", &multem::MultiRegionMasker::ysize)
+    .def("image_size", &multem::MultiRegionMasker::image_size)
+    .def("pixel_size", &multem::MultiRegionMasker::pixel_size)
+    .def("zmin", &multem::MultiRegionMasker::zmin)
+    .def("zmax", &multem::MultiRegionMasker::zmax)
+    .def("set_rotation", &multem::MultiRegionMasker::set_rotation)
+    .def("set_translation", &multem::MultiRegionMasker::set_translation)
     ;
 
   // Expose the simulation function
@@ -1307,8 +1337,12 @@ PYBIND11_MODULE(multem_ext, m)
       &py::detail::simulate_slices, 
       py::call_guard<py::gil_scoped_release>());
   m.def(
-      "simulate", 
-      &multem::simulate_with_ice_approximation, 
+      "simulate",
+      &multem::simulate_with_ice_approximation,
+      py::call_guard<py::gil_scoped_release>());
+  m.def(
+      "simulate",
+      &multem::simulate_with_multi_material,
       py::call_guard<py::gil_scoped_release>());
   m.def(
       "compute_projected_potential", 

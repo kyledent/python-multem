@@ -1099,11 +1099,15 @@ namespace multem {
 
 
   /**
-   * A class to represent the GRF ice parameters
+   * A class to represent the GRF ice parameters.
+   *
+   * The m0 and v0 fields allow overriding the mean potential and variance
+   * calibration constants (default: calibrated against MD water model).
+   * Set to a value >= 0 to override; -1 uses the built-in water defaults.
    */
   class IceParameters {
   public:
-    
+
     double m1;
     double m2;
     double s1;
@@ -1111,6 +1115,8 @@ namespace multem {
     double a1;
     double a2;
     double density;
+    double m0;  // Mean potential constant override (-1 = use default 145.59)
+    double v0;  // Variance constant override (-1 = use default 10195.82)
 
     IceParameters()
       : m1(0),
@@ -1119,7 +1125,9 @@ namespace multem {
         s2(0.081),
         a1(0.199),
         a2(0.801),
-        density(0.91) {}
+        density(0.91),
+        m0(-1),
+        v0(-1) {}
   };
 
   /**
@@ -1378,6 +1386,131 @@ namespace multem {
     CuboidMasker cuboid_masker_;
     CylinderMasker cylinder_masker_;
     IceParameters ice_parameters_;
+  };
+
+
+  /**
+   * A region within a multi-region masker.
+   *
+   * Each region has a shape (Masker) and material (IceParameters).
+   * Optionally, another region's shape can be subtracted from this one
+   * (boolean AND NOT), enabling geometries like "cuboid minus cylinder"
+   * for a holey foil.
+   */
+  struct MaskerRegion {
+    Masker shape;
+    IceParameters material;
+    std::vector<int> subtract_regions;  // indices of regions to subtract
+
+    MaskerRegion()
+      : subtract_regions() {}
+  };
+
+
+  /**
+   * A masker supporting multiple spatial regions, each with its own
+   * material GRF parameters.
+   *
+   * Enables composite geometries such as:
+   *   Region 0: ice (cylinder = hole shape)
+   *   Region 1: foil (cuboid minus region 0 = annulus)
+   *
+   * All regions share the same image size, pixel size, rotation, and
+   * translation (for tilt-series consistency).
+   */
+  class MultiRegionMasker {
+  public:
+
+    MultiRegionMasker()
+      : xsize_(0), ysize_(0), pixel_size_(1) {}
+
+    MultiRegionMasker(std::size_t xsize, std::size_t ysize, double pixel_size)
+      : xsize_(xsize), ysize_(ysize), pixel_size_(pixel_size) {}
+
+    /**
+     * Add a region with its shape and material parameters.
+     * @param shape The shape primitive for this region
+     * @param material The GRF parameters for this region
+     * @param subtract_regions Indices of regions whose shapes are subtracted
+     */
+    void add_region(
+        const Masker &shape,
+        const IceParameters &material,
+        const std::vector<int> &subtract_regions = std::vector<int>()) {
+      MaskerRegion region;
+      region.shape = shape;
+      region.material = material;
+      region.subtract_regions = subtract_regions;
+      regions_.push_back(region);
+    }
+
+    /**
+     * Get the number of regions
+     */
+    std::size_t num_regions() const {
+      return regions_.size();
+    }
+
+    /**
+     * Get a region by index
+     */
+    const MaskerRegion& region(std::size_t i) const {
+      MULTEM_ASSERT(i < regions_.size());
+      return regions_[i];
+    }
+
+    /**
+     * Get image dimensions
+     */
+    std::size_t xsize() const { return xsize_; }
+    std::size_t ysize() const { return ysize_; }
+    std::size_t image_size() const { return xsize_ * ysize_; }
+    double pixel_size() const { return pixel_size_; }
+
+    /**
+     * Get the z-extent across all regions
+     */
+    double zmin() const {
+      double z = 1e10;
+      for (auto &r : regions_) {
+        z = std::min(z, r.shape.zmin());
+      }
+      return z;
+    }
+
+    double zmax() const {
+      double z = -1e10;
+      for (auto &r : regions_) {
+        z = std::max(z, r.shape.zmax());
+      }
+      return z;
+    }
+
+    /**
+     * Set rotation for ALL regions (tilt-series support)
+     */
+    void set_rotation(
+        std::array<double, 3> centre,
+        std::array<double, 3> rotvec) {
+      for (auto &r : regions_) {
+        r.shape.set_rotation(centre, rotvec);
+      }
+    }
+
+    /**
+     * Set translation for ALL regions
+     */
+    void set_translation(std::array<double, 3> translation) {
+      for (auto &r : regions_) {
+        r.shape.set_translation(translation);
+      }
+    }
+
+  private:
+    std::size_t xsize_;
+    std::size_t ysize_;
+    double pixel_size_;
+    std::vector<MaskerRegion> regions_;
   };
 }
 

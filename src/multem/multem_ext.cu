@@ -882,6 +882,49 @@ namespace multem {
     }
 
     /**
+     * GPU functor for boolean AND-NOT operation on masks
+     */
+    struct BoolAndNot {
+      DEVICE_CALLABLE
+      bool operator()(bool a, bool b) const {
+        return a && !b;
+      }
+    };
+
+    /**
+     * Compute the mask for a single region of a MultiRegionMasker,
+     * applying boolean SUBTRACT operations.
+     */
+    template <typename BoolVector>
+    void compute_region_mask(
+        const MultiRegionMasker &masker,
+        std::size_t region_index,
+        double zs, double ze,
+        BoolVector &output,
+        BoolVector &scratch) {
+
+      const auto &region = masker.region(region_index);
+
+      // Compute primary shape mask
+      masker_compute_mask(region.shape, zs, ze, output.begin());
+
+      // Apply boolean SUBTRACT for each subtracted region
+      for (int sub_idx : region.subtract_regions) {
+        MULTEM_ASSERT(sub_idx >= 0 && sub_idx < (int)masker.num_regions());
+        const auto &sub_region = masker.region(sub_idx);
+        masker_compute_mask(sub_region.shape, zs, ze, scratch.begin());
+
+        // output = output AND NOT scratch
+        thrust::transform(
+            output.begin(),
+            output.end(),
+            scratch.begin(),
+            output.begin(),
+            BoolAndNot());
+      }
+    }
+
+    /**
      * Compute the FT of the Gaussian Random Field
      */
     template <typename T>
@@ -1446,7 +1489,298 @@ namespace multem {
             AddRandomFieldAndPotential<FloatType>(1, 0.05));
       }
     };
-   
+
+
+    /**
+     * Multi-material GRF potential approximation.
+     *
+     * Generalises IcePotentialApproximation to N spatial regions, each with
+     * its own shape mask, material parameters, and independent GRF.
+     * Supports boolean SUBTRACT operations between regions.
+     */
+    template <typename FloatType, mt::eDevice DeviceType>
+    class MultiMaterialPotentialApproximation : public mt::PotentialFunction<FloatType, DeviceType> {
+    public:
+
+      using T_r = FloatType;
+      using T_c = complex<FloatType>;
+
+      /**
+       * Per-region state: mask, GRF buffers, material parameters.
+       */
+      struct RegionState {
+        double a1, a2, m1, m2, s1, s2, density, m0, v0;
+        mt::Vector<bool, DeviceType> mask;
+        mt::Vector<T_r, DeviceType> amplitude;
+        mt::Vector<T_c, DeviceType> fft_data;
+        std::size_t fft_data_counter;
+        mt::Vector<T_r, DeviceType> random_field;
+
+        RegionState()
+          : a1(0.199), a2(0.801), m1(0), m2(1.0/2.88),
+            s1(0.731), s2(0.081), density(0.91),
+            m0(-1), v0(-1), fft_data_counter(0) {}
+
+        void set_from_ice_parameters(const IceParameters &p) {
+          m1 = p.m1; m2 = p.m2;
+          s1 = p.s1; s2 = p.s2;
+          a1 = p.a1; a2 = p.a2;
+          density = p.density;
+          m0 = p.m0; v0 = p.v0;
+        }
+
+        void resize(std::size_t size) {
+          mask.resize(size);
+          amplitude.resize(size);
+          fft_data.resize(size);
+          random_field.resize(size);
+          fft_data_counter = 0;
+        }
+      };
+
+      thrust::default_random_engine gen_;
+      double x_pixel_size_;
+      double y_pixel_size_;
+      mt::Grid_2d<FloatType> grid_2d_;
+      mt::FFT<T_r, DeviceType> *fft_2d_;
+      MultiRegionMasker masker_;
+      std::vector<RegionState> regions_;
+      mt::Vector<bool, DeviceType> scratch_mask_;  // for boolean SUBTRACT
+
+      MultiMaterialPotentialApproximation()
+        : gen_(std::random_device()()),
+          x_pixel_size_(1),
+          y_pixel_size_(1),
+          fft_2d_(NULL) {}
+
+      const MultiRegionMasker& masker() const { return masker_; }
+      MultiRegionMasker& masker() { return masker_; }
+
+      void set_masker(const MultiRegionMasker &masker) {
+        masker_ = masker;
+        regions_.resize(masker.num_regions());
+        for (std::size_t i = 0; i < masker.num_regions(); ++i) {
+          regions_[i].set_from_ice_parameters(masker.region(i).material);
+        }
+      }
+
+      void set_grid(mt::Grid_2d<FloatType> grid_2d) {
+        if (grid_2d.nx != grid_2d_.nx || grid_2d.ny != grid_2d_.ny) {
+          grid_2d_ = grid_2d;
+          std::size_t size = grid_2d.nx * grid_2d.ny;
+          for (auto &r : regions_) {
+            r.resize(size);
+          }
+          scratch_mask_.resize(size);
+        }
+      }
+
+      void set_pixel_size(double x_pixel_size, double y_pixel_size) {
+        if (x_pixel_size_ != x_pixel_size || y_pixel_size_ != y_pixel_size) {
+          x_pixel_size_ = x_pixel_size;
+          y_pixel_size_ = y_pixel_size;
+          for (auto &r : regions_) {
+            r.fft_data_counter = 0;
+          }
+        }
+      }
+
+      void set_fft_2d(mt::FFT<T_r, DeviceType> *fft_2d) {
+        fft_2d_ = fft_2d;
+      }
+
+      void set_random_engine(const thrust::default_random_engine &gen) {
+        gen_ = gen;
+      }
+
+      /**
+       * Compute mean potential for a region, using m0 override if set.
+       */
+      double compute_mean(double n_particles, double m0_override) const {
+        double M0 = (m0_override >= 0) ? m0_override : 145.59;
+        double pixel_area = x_pixel_size_ * y_pixel_size_;
+        // Reuse the water correction table (geometry-dependent, not material-specific)
+        double Cv = compute_mean_correction(pixel_area);
+        return M0 * Cv * n_particles;
+      }
+
+      double compute_sigma(double n_particles, double v0_override) const {
+        double V0 = (v0_override >= 0) ? v0_override : 10195.82;
+        double pixel_area = x_pixel_size_ * y_pixel_size_;
+        double Cv = compute_variance_correction(pixel_area);
+        double var = V0 * Cv * n_particles;
+        MULTEM_ASSERT(var > 0);
+        return std::sqrt(var);
+      }
+
+      // Reuse the water correction lookup tables from IcePotentialApproximation.
+      // These are geometry-dependent (pixel area averaging), not material-specific.
+
+      double compute_mean_correction(double pixel_area) const {
+        std::vector<double> X = {
+          0.00, 0.01, 0.04, 0.09, 0.16, 0.25, 0.36, 0.49, 0.64,
+          0.81, 1.00, 1.21, 1.44, 1.69, 1.96, 2.25, 2.56, 2.89,
+          3.24, 3.61, 4.00,
+        };
+        std::vector<double> Y = {
+          1.0000000, 0.9869169, 0.9721861, 0.9314034, 0.8891530,
+          0.8399952, 0.7683486, 0.6905079, 0.6183030, 0.5508759,
+          0.4882256, 0.4198879, 0.3569115, 0.3002320, 0.2496320,
+          0.2069645, 0.1744770, 0.1455832, 0.1215575, 0.1005858,
+          0.0829289,
+        };
+        MULTEM_ASSERT(X.size() == Y.size());
+        return interpolate(pixel_area, X.begin(), X.end(), Y.begin());
+      }
+
+      double compute_variance_correction(double pixel_area) const {
+        std::vector<double> X = {
+          0.00, 0.01, 0.04, 0.09, 0.16, 0.25, 0.36, 0.49, 0.64,
+          0.81, 1.00, 1.21, 1.44, 1.69, 1.96, 2.25, 2.56, 2.89,
+          3.24, 3.61, 4.00,
+        };
+        std::vector<double> Y = {
+          1.0000000, 0.9700153, 0.8800613, 0.6806234, 0.5554587,
+          0.4366297, 0.3030281, 0.2042889, 0.1415119, 0.0977480,
+          0.0653799, 0.0399950, 0.0239591, 0.0142913, 0.0086151,
+          0.0051690, 0.0029370, 0.0019504, 0.0011146, 0.0007561,
+          0.0003838,
+        };
+        MULTEM_ASSERT(X.size() == Y.size());
+        return interpolate(pixel_area, X.begin(), X.end(), Y.begin());
+      }
+
+      template <typename Iterator>
+      double interpolate(double x, Iterator xfirst, Iterator xlast, Iterator yfirst) const {
+        std::size_t size = xlast - xfirst;
+        MULTEM_ASSERT(size >= 2);
+        std::size_t index = 0;
+        while ((index < size-2) && (*(xfirst+index+1) < x)) ++index;
+        double x0 = *(xfirst+index);
+        double y0 = *(yfirst+index);
+        double x1 = *(xfirst+index+1);
+        double y1 = *(yfirst+index+1);
+        return (x < x0 ? y0 : (x > x1 ? y1 : (y0 + (y1 - y0)*(x - x0)/(x1 - x0))));
+      }
+
+      double compute_number_density_of_water(double density) const {
+        double avogadros_number = 6.02214076e+23;
+        double volume = 1;
+        double molar_mass_of_water = 18.01528;
+        double density_of_water = density * 1000;
+        double mass_of_water = (density_of_water * 1000) * (volume * std::pow(1e-10, 3));
+        double number_of_waters = (mass_of_water / molar_mass_of_water) * avogadros_number;
+        return number_of_waters;
+      }
+
+      /**
+       * Generate a GRF for a single region, masked and normalized.
+       */
+      void compute_grf_for_region(
+          RegionState &reg,
+          double mean, double sigma) {
+
+        std::size_t xsize = grid_2d_.nx;
+        std::size_t ysize = grid_2d_.ny;
+        std::size_t size = xsize * ysize;
+
+        // Compute amplitude on first call (or after grid resize)
+        if (reg.fft_data_counter == 0) {
+          thrust::counting_iterator<size_t> indices(0);
+          thrust::transform(
+              indices, indices + size,
+              reg.amplitude.begin(),
+              ComputeGaussianRandomFieldAmplitude<T_r>(
+                reg.a1, reg.a2, reg.m1, reg.m2, reg.s1, reg.s2,
+                xsize, ysize, x_pixel_size_, y_pixel_size_));
+        }
+
+        // Generate two random fields per FFT (real + imag)
+        if ((reg.fft_data_counter & 1) == 0) {
+          thrust::counting_iterator<size_t> indices(0);
+          thrust::transform(
+              indices, indices + size,
+              reg.amplitude.begin(),
+              reg.fft_data.begin(),
+              ComputeGaussianRandomField<thrust::default_random_engine, T_c>(gen_));
+          gen_.discard(size);
+
+          mt::fft2_shift(grid_2d_, reg.fft_data);
+          fft_2d_->inverse(reg.fft_data);
+          mt::assign_real(reg.fft_data, reg.random_field);
+        } else {
+          mt::assign_imag(reg.fft_data, reg.random_field);
+        }
+
+        // Normalize
+        MULTEM_ASSERT(reg.random_field.size() > 0);
+        double rf_mean = thrust::reduce(
+            reg.random_field.begin(), reg.random_field.end(),
+            double(0), mt::functor::add<double>()) / reg.random_field.size();
+
+        double sdev = std::sqrt(thrust::transform_reduce(
+            reg.random_field.begin(), reg.random_field.end(),
+            mt::functor::square_dif<double, double>(rf_mean),
+            double(0), mt::functor::add<double>()) / reg.random_field.size());
+
+        MULTEM_ASSERT(sigma > 0);
+        MULTEM_ASSERT(sdev > 0);
+
+        // Mask and normalize
+        thrust::transform(
+            reg.mask.begin(), reg.mask.end(),
+            reg.random_field.begin(),
+            reg.random_field.begin(),
+            MaskAndNormalize(sigma/sdev, mean - rf_mean*sigma/sdev));
+
+        reg.fft_data_counter++;
+      }
+
+      /**
+       * Per-slice callback: compute all region GRFs and add to potential.
+       */
+      void operator()(
+          double z_0,
+          double z_e,
+          mt::Vector<FloatType, DeviceType> &V_0) {
+
+        MULTEM_ASSERT(z_0 < z_e);
+        MULTEM_ASSERT(grid_2d_.nx > 0 && grid_2d_.ny > 0);
+        MULTEM_ASSERT(fft_2d_ != NULL);
+
+        double thickness = z_e - z_0;
+
+        for (std::size_t i = 0; i < regions_.size(); ++i) {
+          auto &reg = regions_[i];
+
+          MULTEM_ASSERT(V_0.size() == reg.random_field.size());
+          MULTEM_ASSERT(reg.mask.size() == reg.random_field.size());
+
+          // Compute mask with boolean subtraction
+          compute_region_mask(masker_, i, z_0, z_e, reg.mask, scratch_mask_);
+
+          // Compute GRF statistics for this material
+          double number_density = compute_number_density_of_water(reg.density);
+          double mean = compute_mean(thickness * number_density, reg.m0);
+          double sigma = compute_sigma(thickness * number_density, reg.v0);
+
+          // Generate and mask the GRF
+          compute_grf_for_region(reg, mean, sigma);
+
+          // Shift the grid
+          mt::fft2_shift(grid_2d_, reg.random_field);
+
+          // Add to potential
+          thrust::transform(
+              reg.random_field.begin(),
+              reg.random_field.end(),
+              V_0.begin(),
+              V_0.begin(),
+              AddRandomFieldAndPotential<FloatType>(1, 0.05));
+        }
+      }
+    };
+
 
     /**
      * Run the multislice simulation
@@ -1561,7 +1895,67 @@ namespace multem {
         }
       }
     }
-    
+
+    /**
+     * Run the multislice simulation with multi-region material GRF.
+     */
+    template <typename FloatType, mt::eDevice DeviceType>
+    void run_multislice_internal(
+      const mt::System_Configuration &system_conf,
+      mt::Input_Multislice<FloatType> &input_multislice,
+      mt::Output_Multislice<FloatType> &output_multislice,
+      const MultiRegionMasker &masker) {
+
+      // Set the system configuration
+      input_multislice.system_conf = system_conf;
+
+      // Open a stream
+      mt::Stream<DeviceType> stream(system_conf.nstream);
+
+      // Create the FFT object
+      mt::FFT<FloatType, DeviceType> fft_2d;
+      fft_2d.create_plan_2d(
+        input_multislice.grid_2d.ny,
+        input_multislice.grid_2d.nx,
+        system_conf.nstream);
+
+      // Setup the multislice simulation
+      mt::Multislice<FloatType, DeviceType> multislice;
+      multislice.set_input_data(&input_multislice, &stream, &fft_2d);
+
+      // Compute the pixel sizes
+      double x_pixel_size = input_multislice.atoms.l_x / input_multislice.grid_2d.nx;
+      double y_pixel_size = input_multislice.atoms.l_y / input_multislice.grid_2d.ny;
+
+      // Setup the multi-material potential approximation
+      MultiMaterialPotentialApproximation<FloatType, DeviceType> potential_function;
+      potential_function.set_fft_2d(&fft_2d);
+      potential_function.set_grid(input_multislice.grid_2d);
+      potential_function.set_masker(masker);
+      potential_function.set_pixel_size(x_pixel_size, y_pixel_size);
+      multislice.set_potential_function(&potential_function);
+
+      // Set the input data
+      output_multislice.set_input_data(&input_multislice);
+
+      // Perform the multislice simulation
+      multislice(output_multislice);
+      stream.synchronize();
+
+      // Get the results
+      output_multislice.gather();
+      output_multislice.clean_temporal();
+      fft_2d.cleanup();
+
+      // If there was an error then throw an exception
+      if (DeviceType == mt::e_device) {
+        auto err = cudaGetLastError();
+        if (err != cudaSuccess) {
+          throw multem::Error(__FILE__, __LINE__, cudaGetErrorString(err));
+        }
+      }
+    }
+
     /**
      * Run the multislice simulation
      * @param system_conf The system configuration
@@ -2258,19 +2652,68 @@ namespace multem {
     } else {
       MULTEM_ASSERT(config.device == "host" || config.device == "device");
       MULTEM_ASSERT(config.precision == "float" || config.precision == "double");
-    } 
+    }
     return result;
   }
-  
+
   /**
-   * Run the multislice simulation. 
+   * Run the multislice simulation with multi-region material GRF.
+   */
+  template <typename FloatType, mt::eDevice DeviceType>
+  Output run_multislice(
+      SystemConfiguration config,
+      Input input,
+      const MultiRegionMasker &masker) {
+
+    // Add sentinel atoms at z extremes (same pattern as single-masker variant)
+    input.spec_atoms.push_back(Atom(1, 0, 0, masker.zmin(), 0, 1, 0, 0));
+    input.spec_atoms.push_back(Atom(1, 0, 0, masker.zmax(), 0, 1, 0, 0));
+
+    // Initialise the system configuration and input structures
+    auto system_conf = detail::read_system_configuration(config);
+    auto input_multislice = detail::read_input_multislice<FloatType>(input);
+    input_multislice.system_conf = system_conf;
+
+    // Create the output structure
+    mt::Output_Multislice<FloatType> output_multislice;
+
+    // Run the simulation
+    detail::run_multislice_internal<FloatType, DeviceType>(
+      system_conf, input_multislice, output_multislice, masker);
+
+    // Return the output struct
+    return detail::write_output_multislice(output_multislice);
+  }
+
+  Output simulate_with_multi_material(
+      SystemConfiguration config,
+      Input input,
+      const MultiRegionMasker &masker) {
+    Output result;
+    if (config.device == "host" && config.precision == "float") {
+      result = run_multislice<float, mt::e_host>(config, input, masker);
+    } else if (config.device == "host" && config.precision == "double") {
+      result = run_multislice<double, mt::e_host>(config, input, masker);
+    } else if (config.device == "device" && config.precision == "float") {
+      result = run_multislice<float, mt::e_device>(config, input, masker);
+    } else if (config.device == "device" && config.precision == "double") {
+      result = run_multislice<double, mt::e_device>(config, input, masker);
+    } else {
+      MULTEM_ASSERT(config.device == "host" || config.device == "device");
+      MULTEM_ASSERT(config.precision == "float" || config.precision == "double");
+    }
+    return result;
+  }
+
+  /**
+   * Run the multislice simulation.
    * @param config The system configuration
    * @param input The input object
    * @returns The output results
    */
   template <typename FloatType, mt::eDevice DeviceType>
   Output run_projected_potential(
-      SystemConfiguration config, 
+      SystemConfiguration config,
       Input input,
       projected_potential_callback callback) {
 
