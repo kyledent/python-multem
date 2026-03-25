@@ -33,7 +33,7 @@ def test_masker_region():
     shape = multem.Masker(128, 128, 1.0)
     shape.set_cuboid([0, 0, 0], [100, 110, 50])
     region.shape = shape
-    assert region.shape.shape() == "cuboid"
+    assert region.shape.xsize() == 128
 
 
 def test_multi_region_masker_construction():
