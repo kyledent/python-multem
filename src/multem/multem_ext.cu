@@ -21,6 +21,7 @@
 #include <xtl_build.hpp>
 #include <output_multislice.hpp>
 #include <tem_simulation.cuh>
+#include <fftw3.h>
 #include <multem/multem_ext.h>
 
 namespace multem {
@@ -2629,14 +2630,16 @@ namespace multem {
       result = run_multislice<float, mt::e_host>(config, input);
     } else if (config.device == "host" && config.precision == "double") {
       result = run_multislice<double, mt::e_host>(config, input);
+#ifndef MULTEM_NO_CUDA
     } else if (config.device == "device" && config.precision == "float") {
       result = run_multislice<float, mt::e_device>(config, input);
     } else if (config.device == "device" && config.precision == "double") {
       result = run_multislice<double, mt::e_device>(config, input);
+#endif
     } else {
       MULTEM_ASSERT(config.device == "host" || config.device == "device");
       MULTEM_ASSERT(config.precision == "float" || config.precision == "double");
-    } 
+    }
     return result;
   }
 
@@ -2649,10 +2652,12 @@ namespace multem {
       result = run_multislice<float, mt::e_host, Masker>(config, input, masker);
     } else if (config.device == "host" && config.precision == "double") {
       result = run_multislice<double, mt::e_host, Masker>(config, input, masker);
+#ifndef MULTEM_NO_CUDA
     } else if (config.device == "device" && config.precision == "float") {
       result = run_multislice<float, mt::e_device, Masker>(config, input, masker);
     } else if (config.device == "device" && config.precision == "double") {
       result = run_multislice<double, mt::e_device, Masker>(config, input, masker);
+#endif
     } else {
       MULTEM_ASSERT(config.device == "host" || config.device == "device");
       MULTEM_ASSERT(config.precision == "float" || config.precision == "double");
@@ -2813,14 +2818,16 @@ namespace multem {
       result = run_projected_potential<float, mt::e_host>(config, input, callback);
     } else if (config.device == "host" && config.precision == "double") {
       result = run_projected_potential<double, mt::e_host>(config, input, callback);
+#ifndef MULTEM_NO_CUDA
     } else if (config.device == "device" && config.precision == "float") {
       result = run_projected_potential<float, mt::e_device>(config, input, callback);
     } else if (config.device == "device" && config.precision == "double") {
       result = run_projected_potential<double, mt::e_device>(config, input, callback);
+#endif
     } else {
       MULTEM_ASSERT(config.device == "host" || config.device == "device");
       MULTEM_ASSERT(config.precision == "float" || config.precision == "double");
-    } 
+    }
     return result;
   }
   
@@ -2834,14 +2841,16 @@ namespace multem {
       result = run_projected_potential<float, mt::e_host, Masker>(config, input, masker, callback);
     } else if (config.device == "host" && config.precision == "double") {
       result = run_projected_potential<double, mt::e_host, Masker>(config, input, masker, callback);
+#ifndef MULTEM_NO_CUDA
     } else if (config.device == "device" && config.precision == "float") {
       result = run_projected_potential<float, mt::e_device, Masker>(config, input, masker, callback);
     } else if (config.device == "device" && config.precision == "double") {
       result = run_projected_potential<double, mt::e_device, Masker>(config, input, masker, callback);
+#endif
     } else {
       MULTEM_ASSERT(config.device == "host" || config.device == "device");
       MULTEM_ASSERT(config.precision == "float" || config.precision == "double");
-    } 
+    }
     return result;
   }
 
@@ -3371,5 +3380,175 @@ namespace multem {
 		test_cylinder_masker();
     test_ice_parameters();
 	}
+
+
+  // ── Phase E: X-ray multislice simulation ──────────────────────────────
+
+  XrayExitWave simulate_xray(
+      const MultiRegionMasker &masker,
+      const std::vector<XrayRegionInfo> &regions,
+      double wavelength,
+      double pixel_size,
+      double slice_thickness,
+      std::size_t nx,
+      std::size_t ny) {
+
+    MULTEM_ASSERT(regions.size() == masker.num_regions());
+    MULTEM_ASSERT(wavelength > 0);
+    MULTEM_ASSERT(pixel_size > 0);
+    MULTEM_ASSERT(slice_thickness > 0);
+    MULTEM_ASSERT(nx > 0 && ny > 0);
+
+    const double c_Pi = 3.141592653589793238463;
+    const double k = 2.0 * c_Pi / wavelength;  // wavenumber
+    const std::size_t npix = nx * ny;
+
+    // Determine z-range from masker geometry
+    double z_min = masker.zmin();
+    double z_max = masker.zmax();
+    MULTEM_ASSERT(z_max > z_min);
+
+    // Number of slices
+    double specimen_thickness = z_max - z_min;
+    int n_slices = std::max(1, (int)std::ceil(specimen_thickness / slice_thickness));
+    double dz = specimen_thickness / n_slices;
+
+    // Build Fresnel propagator in Fourier space: exp(i*pi*lambda*dz*f^2)
+    // Frequency grid: fx[i] = i/N/pixel_size for i < N/2, (i-N)/N/pixel_size for i >= N/2
+    std::vector< std::complex<double> > propagator(npix);
+    for (std::size_t iy = 0; iy < ny; ++iy) {
+      double fy = (iy <= ny/2) ? (double)iy / (ny * pixel_size)
+                                : ((double)iy - (double)ny) / (ny * pixel_size);
+      for (std::size_t ix = 0; ix < nx; ++ix) {
+        double fx = (ix <= nx/2) ? (double)ix / (nx * pixel_size)
+                                  : ((double)ix - (double)nx) / (nx * pixel_size);
+        double f2 = fx*fx + fy*fy;
+        double phase = c_Pi * wavelength * dz * f2;
+        propagator[iy * nx + ix] = std::complex<double>(cos(phase), sin(phase));
+      }
+    }
+
+    // Allocate per-region mask buffers (host)
+    // NOTE: use uint8_t, not bool — std::vector<bool> is bitpacked with
+    // _Bit_iterator that is incompatible with thrust::transform in CUDA 12.
+    std::vector< std::vector<uint8_t> > region_masks(regions.size(),
+                                                      std::vector<uint8_t>(npix, 0));
+    std::vector<uint8_t> scratch(npix, 0);
+
+    // Initialise wave function: psi = 1 (plane wave)
+    std::vector< std::complex<double> > psi(npix, std::complex<double>(1.0, 0.0));
+    std::vector< std::complex<double> > psi_ft(npix);
+    std::vector< std::complex<double> > trans(npix);
+
+    // Allocate per-pixel delta/beta arrays
+    std::vector<double> delta_map(npix);
+    std::vector<double> beta_map(npix);
+
+    // Create FFTW plans for 2D forward and inverse transforms.
+    // FFTW_ESTIMATE avoids overwriting input arrays during planning.
+    // Note: fftw_plan_dft_2d takes (rows, cols) = (ny, nx).
+    fftw_plan plan_fwd = fftw_plan_dft_2d(
+        (int)ny, (int)nx,
+        reinterpret_cast<fftw_complex*>(psi.data()),
+        reinterpret_cast<fftw_complex*>(psi_ft.data()),
+        FFTW_FORWARD, FFTW_ESTIMATE);
+    fftw_plan plan_inv = fftw_plan_dft_2d(
+        (int)ny, (int)nx,
+        reinterpret_cast<fftw_complex*>(psi_ft.data()),
+        reinterpret_cast<fftw_complex*>(psi.data()),
+        FFTW_BACKWARD, FFTW_ESTIMATE);
+
+    // ─── Multislice loop ────────────────────────────────────────────
+    for (int islice = 0; islice < n_slices; ++islice) {
+      double z_0 = z_min + islice * dz;
+      double z_e = z_0 + dz;
+
+      // Compute masks for all regions in this slice
+      for (std::size_t r = 0; r < regions.size(); ++r) {
+        // Use masker_compute_mask for the region's shape
+        const auto &region = masker.region(r);
+        detail::masker_compute_mask(region.shape, z_0, z_e,
+                                    region_masks[r].begin());
+
+        // Apply boolean subtraction
+        for (int sub_idx : region.subtract_regions) {
+          MULTEM_ASSERT(sub_idx >= 0 && sub_idx < (int)masker.num_regions());
+          const auto &sub_region = masker.region(sub_idx);
+          detail::masker_compute_mask(sub_region.shape, z_0, z_e,
+                                      scratch.begin());
+          for (std::size_t p = 0; p < npix; ++p) {
+            if (scratch[p]) region_masks[r][p] = 0;
+          }
+        }
+      }
+
+      // Build per-pixel (delta, beta) from region masks
+      // Pixels not covered by any region: vacuum (delta=0, beta=0)
+      std::fill(delta_map.begin(), delta_map.end(), 0.0);
+      std::fill(beta_map.begin(),  beta_map.end(),  0.0);
+
+      // Last-region-wins: later regions override earlier ones
+      for (std::size_t r = 0; r < regions.size(); ++r) {
+        double d = regions[r].delta;
+        double b = regions[r].beta;
+        for (std::size_t p = 0; p < npix; ++p) {
+          if (region_masks[r][p]) {
+            delta_map[p] = d;
+            beta_map[p] = b;
+          }
+        }
+      }
+
+      // Build complex transmission function:
+      // t(x,y) = exp[-(2*pi/lambda) * (beta + i*delta) * dz]
+      for (std::size_t p = 0; p < npix; ++p) {
+        double amp_arg = -k * beta_map[p] * dz;
+        double phase_arg = -k * delta_map[p] * dz;
+        double amp = exp(amp_arg);
+        trans[p] = std::complex<double>(amp * cos(phase_arg),
+                                         amp * sin(phase_arg));
+      }
+
+      // Apply transmission: psi *= trans
+      for (std::size_t p = 0; p < npix; ++p) {
+        psi[p] *= trans[p];
+      }
+
+      // Fresnel propagation: psi = IFFT(FFT(psi) * propagator)
+      // Using FFTW for O(N log N) performance.
+      // Forward FFT: psi -> psi_ft
+      fftw_execute_dft(plan_fwd,
+          reinterpret_cast<fftw_complex*>(psi.data()),
+          reinterpret_cast<fftw_complex*>(psi_ft.data()));
+
+      // Multiply by propagator in Fourier space
+      for (std::size_t p = 0; p < npix; ++p) {
+        psi_ft[p] *= propagator[p];
+      }
+
+      // Inverse FFT: psi_ft -> psi
+      fftw_execute_dft(plan_inv,
+          reinterpret_cast<fftw_complex*>(psi_ft.data()),
+          reinterpret_cast<fftw_complex*>(psi.data()));
+
+      // FFTW inverse is unnormalized; divide by N
+      double inv_npix = 1.0 / (double)npix;
+      for (std::size_t p = 0; p < npix; ++p) {
+        psi[p] *= inv_npix;
+      }
+    }
+
+    // Destroy FFTW plans
+    fftw_destroy_plan(plan_fwd);
+    fftw_destroy_plan(plan_inv);
+
+    // Build result
+    XrayExitWave result;
+    result.nx = nx;
+    result.ny = ny;
+    result.psi = std::move(psi);
+    return result;
+  }
+
 }
 

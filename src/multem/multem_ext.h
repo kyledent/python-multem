@@ -842,10 +842,68 @@ namespace multem {
 
   std::vector<Atom> crystal_by_layers(const CrystalParameters &params);
   std::vector< std::pair<double, double> > compute_V_params(
-      std::string potential_type, 
-      std::size_t Z, 
+      std::string potential_type,
+      std::size_t Z,
       int charge);
 
+
+  // ── Phase E: X-ray multislice simulation ──────────────────────────────
+
+  /**
+   * Per-region X-ray optical constants.
+   * delta = refractive decrement (real part of n = 1 - delta + i*beta)
+   * beta  = extinction coefficient (imaginary part)
+   * Both are dimensionless bulk values at the simulation energy.
+   */
+  struct XrayRegionInfo {
+    double delta;
+    double beta;
+
+    XrayRegionInfo() : delta(0), beta(0) {}
+    XrayRegionInfo(double d, double b) : delta(d), beta(b) {}
+  };
+
+  /**
+   * X-ray multislice exit wave result.
+   * Contains the complex exit wave and image dimensions.
+   */
+  struct XrayExitWave {
+    std::size_t nx;
+    std::size_t ny;
+    std::vector< std::complex<double> > psi;  // row-major (ny, nx)
+
+    XrayExitWave() : nx(0), ny(0) {}
+  };
+
+  /**
+   * Run X-ray multislice simulation using MULTEM's GPU infrastructure.
+   *
+   * Computes the exit wave for a specimen described by a MultiRegionMasker
+   * with per-region X-ray optical constants (delta, beta). Uses Fresnel
+   * propagation (wavelength-agnostic) and X-ray transmission function:
+   *   t(x,y) = exp[-(2*pi/lambda) * (beta_z + i*delta_z) * dz]
+   *
+   * This bypasses MULTEM's electron scattering factor infrastructure
+   * entirely, using only the masker geometry and FFT/propagation engine.
+   *
+   * @param masker       MultiRegionMasker defining specimen geometry
+   * @param regions      Per-region (delta, beta) values, same order as masker
+   * @param wavelength   Photon wavelength in the SAME length units as masker
+   *                     (typically um; lambda_510eV = 2.43e-3 um)
+   * @param pixel_size   Pixel size in same units as masker (um)
+   * @param slice_thickness  Slice thickness in same units (um)
+   * @param nx           Image width in pixels
+   * @param ny           Image height in pixels
+   * @returns            XrayExitWave containing complex exit wave
+   */
+  XrayExitWave simulate_xray(
+      const MultiRegionMasker &masker,
+      const std::vector<XrayRegionInfo> &regions,
+      double wavelength,
+      double pixel_size,
+      double slice_thickness,
+      std::size_t nx,
+      std::size_t ny);
 
   /**
    * Tests

@@ -1376,6 +1376,44 @@ PYBIND11_MODULE(multem_ext, m)
   m.def("crystal_by_layers", &multem::crystal_by_layers);
   m.def("compute_V_params", &multem::compute_V_params);
 
+  // ── Phase E: X-ray multislice ──────────────────────────────────────
+
+  py::class_<multem::XrayRegionInfo>(m, "XrayRegionInfo")
+    .def(py::init<>())
+    .def(py::init<double, double>(), py::arg("delta"), py::arg("beta"))
+    .def_readwrite("delta", &multem::XrayRegionInfo::delta)
+    .def_readwrite("beta", &multem::XrayRegionInfo::beta)
+    ;
+
+  py::class_<multem::XrayExitWave>(m, "XrayExitWave")
+    .def(py::init<>())
+    .def_readonly("nx", &multem::XrayExitWave::nx)
+    .def_readonly("ny", &multem::XrayExitWave::ny)
+    .def("psi_numpy", [](const multem::XrayExitWave &self) {
+      // Return a numpy array view of the complex exit wave (ny, nx)
+      py::array_t< std::complex<double> > arr({self.ny, self.nx});
+      auto buf = arr.mutable_unchecked<2>();
+      for (std::size_t iy = 0; iy < self.ny; ++iy) {
+        for (std::size_t ix = 0; ix < self.nx; ++ix) {
+          buf(iy, ix) = self.psi[iy * self.nx + ix];
+        }
+      }
+      return arr;
+    })
+    ;
+
+  m.def(
+      "simulate_xray",
+      &multem::simulate_xray,
+      py::call_guard<py::gil_scoped_release>(),
+      py::arg("masker"),
+      py::arg("regions"),
+      py::arg("wavelength"),
+      py::arg("pixel_size"),
+      py::arg("slice_thickness"),
+      py::arg("nx"),
+      py::arg("ny"));
+
   // Expose some tests
   m.def("test_ice_potential_approximation", &multem::test_ice_potential_approximation);
 	m.def("test_masker", &multem::test_masker);
