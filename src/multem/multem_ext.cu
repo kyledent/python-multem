@@ -876,8 +876,10 @@ namespace multem {
         compute_mask(masker.cuboid_masker(), zs, ze, iterator);
       } else if (masker.shape() == Masker::Cylinder) {
         compute_mask(masker.cylinder_masker(), zs, ze, iterator);
+      } else if (masker.shape() == Masker::Sphere) {
+        masker.sphere_masker().compute_mask(zs, ze, iterator);
       } else {
-        MULTEM_ASSERT(false); // Should never reach here
+        MULTEM_ASSERT(false); // Unknown shape
       }
     }
 
@@ -1928,10 +1930,12 @@ namespace multem {
       double y_pixel_size = input_multislice.atoms.l_y / input_multislice.grid_2d.ny;
 
       // Setup the multi-material potential approximation
+      // NB: set_masker must be called before set_grid, because set_masker
+      // recreates the region array and set_grid resizes the region buffers.
       MultiMaterialPotentialApproximation<FloatType, DeviceType> potential_function;
       potential_function.set_fft_2d(&fft_2d);
-      potential_function.set_grid(input_multislice.grid_2d);
       potential_function.set_masker(masker);
+      potential_function.set_grid(input_multislice.grid_2d);
       potential_function.set_pixel_size(x_pixel_size, y_pixel_size);
       multislice.set_potential_function(&potential_function);
 
@@ -2685,19 +2689,50 @@ namespace multem {
     return detail::write_output_multislice(output_multislice);
   }
 
+  /**
+   * Run the multislice simulation with MultiRegionMasker.
+   *
+   * This is a separate overload (not using the generic run_multislice template)
+   * to ensure the MultiRegionMasker-specific run_multislice_internal overload
+   * (which uses MultiMaterialPotentialApproximation) is called, rather than the
+   * generic template version (which uses IcePotentialApproximation).
+   */
+  template <typename FloatType, mt::eDevice DeviceType>
+  Output run_multislice_multi_material(
+      SystemConfiguration config, Input input, const MultiRegionMasker &masker) {
+
+    // Add hydrogen atoms at z extremes so MULTEM creates slices
+    input.spec_atoms.push_back(Atom(1, 0, 0, masker.zmin(), 0, 1, 0, 0));
+    input.spec_atoms.push_back(Atom(1, 0, 0, masker.zmax(), 0, 1, 0, 0));
+
+    auto system_conf = detail::read_system_configuration(config);
+    auto input_multislice = detail::read_input_multislice<FloatType>(input);
+    input_multislice.system_conf = system_conf;
+
+    mt::Output_Multislice<FloatType> output_multislice;
+
+    // Calls the MultiRegionMasker-specific overload (2 template params)
+    detail::run_multislice_internal<FloatType, DeviceType>(
+      system_conf, input_multislice, output_multislice, masker);
+
+    return detail::write_output_multislice(output_multislice);
+  }
+
   Output simulate_with_multi_material(
       SystemConfiguration config,
       Input input,
       const MultiRegionMasker &masker) {
     Output result;
     if (config.device == "host" && config.precision == "float") {
-      result = run_multislice<float, mt::e_host>(config, input, masker);
+      result = run_multislice_multi_material<float, mt::e_host>(config, input, masker);
     } else if (config.device == "host" && config.precision == "double") {
-      result = run_multislice<double, mt::e_host>(config, input, masker);
+      result = run_multislice_multi_material<double, mt::e_host>(config, input, masker);
+#ifndef MULTEM_NO_CUDA
     } else if (config.device == "device" && config.precision == "float") {
-      result = run_multislice<float, mt::e_device>(config, input, masker);
+      result = run_multislice_multi_material<float, mt::e_device>(config, input, masker);
     } else if (config.device == "device" && config.precision == "double") {
-      result = run_multislice<double, mt::e_device>(config, input, masker);
+      result = run_multislice_multi_material<double, mt::e_device>(config, input, masker);
+#endif
     } else {
       MULTEM_ASSERT(config.device == "host" || config.device == "device");
       MULTEM_ASSERT(config.precision == "float" || config.precision == "double");

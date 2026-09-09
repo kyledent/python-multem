@@ -595,6 +595,160 @@ namespace multem {
 
 
   /**
+   * A sphere masker
+   *
+   * Spheres are rotation-invariant, so only the centre needs to be
+   * transformed from sample to microscope coordinates.  The containment
+   * test is a simple squared-distance check.
+   */
+  class SphereMasker {
+  public:
+
+    using vector3 = std::array<double, 3>;
+
+    SphereMasker()
+      : xsize_(0),
+        ysize_(0),
+        pixel_size_(1),
+        centre_({0, 0, 0}),
+        radius_(0),
+        translation_({ 0, 0, 0 }),
+        rotation_centre_({0, 0, 0}),
+        rotation_vector_({0, 0, 0}),
+        centre_m_({0, 0, 0}),
+        pmin_({0, 0, 0}),
+        pmax_({0, 0, 0}) {
+      update_geometry();
+    }
+
+    std::size_t xsize() const { return xsize_; }
+    std::size_t ysize() const { return ysize_; }
+    std::size_t image_size() const { return xsize_ * ysize_; }
+    double pixel_size() const { return pixel_size_; }
+
+    double xmin() const { return pmin_[0]; }
+    double ymin() const { return pmin_[1]; }
+    double zmin() const { return pmin_[2]; }
+    double xmax() const { return pmax_[0]; }
+    double ymax() const { return pmax_[1]; }
+    double zmax() const { return pmax_[2]; }
+
+    const vector3& centre() const { return centre_; }
+    double radius() const { return radius_; }
+
+    const vector3& rotation_origin() const { return rotation_centre_; }
+    double rotation_angle() const { return detail::norm(rotation_vector_); }
+    const vector3& rotation_vector() const { return rotation_vector_; }
+    const vector3& translation() const { return translation_; }
+
+    void set_image_size(std::size_t xsize, std::size_t ysize) {
+      MULTEM_ASSERT(xsize > 0);
+      MULTEM_ASSERT(ysize > 0);
+      xsize_ = xsize;
+      ysize_ = ysize;
+      update_geometry();
+    }
+
+    void set_pixel_size(double pixel_size) {
+      MULTEM_ASSERT(pixel_size > 0);
+      pixel_size_ = pixel_size;
+      update_geometry();
+    }
+
+    void set_parameters(vector3 centre, double radius) {
+      MULTEM_ASSERT(radius > 0);
+      centre_ = centre;
+      radius_ = radius;
+      update_geometry();
+    }
+
+    void set_translation(vector3 translation) {
+      translation_ = translation;
+      update_geometry();
+    }
+
+    void set_rotation(vector3 centre, vector3 rotvec) {
+      rotation_centre_ = centre;
+      rotation_vector_ = rotvec;
+      update_geometry();
+    }
+
+    /**
+     * Transform the centre to microscope coordinates and compute the AABB.
+     *
+     * Since a sphere is rotation-invariant, we only need to transform
+     * the centre point.  The bounding box is centre_m ± radius on each axis.
+     */
+    void update_geometry() {
+      vector3 Rs = rotation_vector_;
+
+      // Transform centre: point(microscope) = Rs*(p - rot_centre) + rot_centre + translation
+      centre_m_ = centre_;
+      centre_m_[0] -= rotation_centre_[0];
+      centre_m_[1] -= rotation_centre_[1];
+      centre_m_[2] -= rotation_centre_[2];
+      centre_m_ = detail::rotate(Rs, centre_m_);
+      centre_m_[0] += rotation_centre_[0] + translation_[0];
+      centre_m_[1] += rotation_centre_[1] + translation_[1];
+      centre_m_[2] += rotation_centre_[2] + translation_[2];
+
+      // AABB = centre ± radius
+      pmin_ = { centre_m_[0] - radius_, centre_m_[1] - radius_, centre_m_[2] - radius_ };
+      pmax_ = { centre_m_[0] + radius_, centre_m_[1] + radius_, centre_m_[2] + radius_ };
+    }
+
+    /**
+     * Compute the sphere mask for a slice [zs, ze).
+     *
+     * At the slice midpoint zc, for each pixel (i,j) test whether
+     * the squared distance to the transformed centre is <= radius^2.
+     */
+    template <typename Iterator>
+    void compute_mask(double zs, double ze, Iterator iterator) const {
+      MULTEM_ASSERT(ze > zs);
+
+      double zc = (zs + ze) / 2.0;
+      double r2 = radius_ * radius_;
+
+      if (zs < zmax() && ze > zmin()) {
+        double dz = zc - centre_m_[2];
+        double dz2 = dz * dz;
+
+        for (std::size_t i = 0; i < xsize_; ++i) {
+          double x = (i + 0.5) * pixel_size_;
+          double dx = x - centre_m_[0];
+          double dx2 = dx * dx;
+
+          for (std::size_t j = 0; j < ysize_; ++j) {
+            double y = (j + 0.5) * pixel_size_;
+            double dy = y - centre_m_[1];
+
+            *iterator = (dx2 + dy * dy + dz2 <= r2);
+            ++iterator;
+          }
+        }
+      } else {
+        std::fill(iterator, iterator + image_size(), 0);
+      }
+    }
+
+  protected:
+
+    std::size_t xsize_;
+    std::size_t ysize_;
+    double pixel_size_;
+    vector3 centre_;
+    double radius_;
+    vector3 translation_;
+    vector3 rotation_centre_;
+    vector3 rotation_vector_;
+    vector3 centre_m_;   // centre in microscope coordinates
+    vector3 pmin_;
+    vector3 pmax_;
+  };
+
+
+  /**
    * A cylinder masker
    */
   class CylinderMasker {
@@ -1141,7 +1295,8 @@ namespace multem {
      */
     enum Shape {
       Cuboid,
-      Cylinder
+      Cylinder,
+      Sphere
     };
 
     /**
@@ -1171,6 +1326,13 @@ namespace multem {
      */
     const CylinderMasker& cylinder_masker() const {
       return cylinder_masker_;
+    }
+
+    /**
+     * Get the sphere masker
+     */
+    const SphereMasker& sphere_masker() const {
+      return sphere_masker_;
     }
 
     /**
@@ -1212,15 +1374,17 @@ namespace multem {
      * Get the minimum x coordinate
      */
     double xmin() const {
+      if (shape() == Sphere) return sphere_masker_.xmin();
       return shape() == Cuboid
         ? cuboid_masker_.xmin()
         : cylinder_masker_.xmin();
     }
-    
+
     /**
      * Get the minimum y coordinate
      */
     double ymin() const {
+      if (shape() == Sphere) return sphere_masker_.ymin();
       return shape() == Cuboid
         ? cuboid_masker_.ymin()
         : cylinder_masker_.ymin();
@@ -1230,24 +1394,27 @@ namespace multem {
      * Get the minimum z coordinate
      */
     double zmin() const {
+      if (shape() == Sphere) return sphere_masker_.zmin();
       return shape() == Cuboid
         ? cuboid_masker_.zmin()
         : cylinder_masker_.zmin();
     }
-    
+
     /**
      * Get the maximum x coordinate
      */
     double xmax() const {
+      if (shape() == Sphere) return sphere_masker_.xmax();
       return shape() == Cuboid
         ? cuboid_masker_.xmax()
         : cylinder_masker_.xmax();
     }
-    
+
     /**
      * Get the maximum y coordinate
      */
     double ymax() const {
+      if (shape() == Sphere) return sphere_masker_.ymax();
       return shape() == Cuboid
         ? cuboid_masker_.ymax()
         : cylinder_masker_.ymax();
@@ -1257,6 +1424,7 @@ namespace multem {
      * Get the maximum z coordinate
      */
     double zmax() const {
+      if (shape() == Sphere) return sphere_masker_.zmax();
       return shape() == Cuboid
         ? cuboid_masker_.zmax()
         : cylinder_masker_.zmax();
@@ -1298,8 +1466,9 @@ namespace multem {
       MULTEM_ASSERT(ysize > 0);
       cuboid_masker_.set_image_size(xsize, ysize);
       cylinder_masker_.set_image_size(xsize, ysize);
+      sphere_masker_.set_image_size(xsize, ysize);
     }
-    
+
     /**
      * Set the pixel size
      */
@@ -1307,6 +1476,7 @@ namespace multem {
       MULTEM_ASSERT(pixel_size > 0);
       cuboid_masker_.set_pixel_size(pixel_size);
       cylinder_masker_.set_pixel_size(pixel_size);
+      sphere_masker_.set_pixel_size(pixel_size);
     }
 
     /**
@@ -1344,19 +1514,30 @@ namespace multem {
     }
 
     /**
+     * Set a sphere mask
+     */
+    void set_sphere(std::array<double, 3> centre, double radius) {
+      MULTEM_ASSERT(radius > 0);
+      shape_ = Sphere;
+      sphere_masker_.set_parameters(centre, radius);
+    }
+
+    /**
      * Set a translation along the x axis
      */
     void set_translation(std::array<double, 3> translation) {
       cuboid_masker_.set_translation(translation);
       cylinder_masker_.set_translation(translation);
+      sphere_masker_.set_translation(translation);
     }
-    
+
     /**
      * Set a rotation about the x axis
      */
     void set_rotation(std::array<double, 3> centre, std::array<double, 3> rotvec) {
       cuboid_masker_.set_rotation(centre, rotvec);
       cylinder_masker_.set_rotation(centre, rotvec);
+      sphere_masker_.set_rotation(centre, rotvec);
     }
    
     /**
@@ -1368,6 +1549,8 @@ namespace multem {
         cuboid_masker_.compute_mask(zs, ze, iterator);
       } else if (shape_ == Cylinder) {
         cylinder_masker_.compute_mask(zs, ze, iterator);
+      } else if (shape_ == Sphere) {
+        sphere_masker_.compute_mask(zs, ze, iterator);
       } else {
         MULTEM_ASSERT(false); // Should never reach here
       }
@@ -1385,6 +1568,7 @@ namespace multem {
     Shape shape_;
     CuboidMasker cuboid_masker_;
     CylinderMasker cylinder_masker_;
+    SphereMasker sphere_masker_;
     IceParameters ice_parameters_;
   };
 

@@ -1251,6 +1251,13 @@ PYBIND11_MODULE(multem_ext, m)
     .def("asdict", &py::detail::Helpers<multem::Output>::asdict)
     ;
 
+  // Wrap the multem::Masker::Shape enum
+  py::enum_<multem::Masker::Shape>(m, "MaskerShape")
+    .value("Cuboid", multem::Masker::Shape::Cuboid)
+    .value("Cylinder", multem::Masker::Shape::Cylinder)
+    .value("Sphere", multem::Masker::Shape::Sphere)
+    .export_values();
+
   // Wrap the multem::Masker class
   py::class_<multem::Masker>(m, "Masker")
     .def(py::init<>())
@@ -1274,6 +1281,7 @@ PYBIND11_MODULE(multem_ext, m)
     .def("set_cube", &multem::Masker::set_cube)
     .def("set_cuboid", &multem::Masker::set_cuboid)
     .def("set_cylinder", &multem::Masker::set_cylinder)
+    .def("set_sphere", &multem::Masker::set_sphere)
     .def("set_rotation", &multem::Masker::set_rotation)
     .def("set_translation", &multem::Masker::set_translation)
     .def("set_ice_parameters", &multem::Masker::set_ice_parameters)

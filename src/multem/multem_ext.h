@@ -15,6 +15,7 @@
 #include <array>
 #include <cassert>
 #include <complex>
+#include <functional>
 #include <string>
 #include <vector>
 #include <multem/error.h>
