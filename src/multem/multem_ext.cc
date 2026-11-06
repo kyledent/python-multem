@@ -34,6 +34,69 @@ namespace pybind11 { namespace detail {
   }
 
   /**
+   * One column of an atom table as a contiguous 1-D array of T.
+   *
+   * Integer columns must hold integers: a forced cast would silently truncate a
+   * float array, so the dtype kind is checked first. Floating columns accept any
+   * real or integer dtype; float32 widens to double exactly.
+   */
+  template <typename T>
+  py::array_t<T, py::array::c_style | py::array::forcecast> atom_column(
+      const py::array &a, const char *name, bool integer, py::ssize_t n) {
+    const char kind = a.dtype().kind();
+    const bool ok = integer ? (kind == 'i' || kind == 'u' || kind == 'b')
+                            : (kind == 'f' || kind == 'i' || kind == 'u');
+    if (!ok) {
+      throw py::type_error(std::string("AtomList.from_arrays: column '") + name +
+                           "' has dtype kind '" + kind + "', expected " +
+                           (integer ? "an integer" : "a real or integer") + " array");
+    }
+    if (a.ndim() != 1) {
+      throw py::value_error(std::string("AtomList.from_arrays: column '") + name +
+                            "' must be one-dimensional");
+    }
+    if (n >= 0 && a.shape(0) != n) {
+      throw py::value_error(std::string("AtomList.from_arrays: column '") + name + "' has " +
+                            std::to_string(a.shape(0)) + " entries, expected " +
+                            std::to_string(n));
+    }
+    return py::array_t<T, py::array::c_style | py::array::forcecast>::ensure(a);
+  }
+
+  /**
+   * Build an atom list from columns.
+   *
+   * The same atoms as AtomList(zip(element, x, y, z, sigma, occupancy, region,
+   * charge)), without a Python tuple and eight scalar conversions per atom: the
+   * vector is filled from the arrays directly, with the GIL released.
+   */
+  std::vector<multem::Atom> AtomList_from_arrays(
+      const py::array &element, const py::array &x, const py::array &y,
+      const py::array &z, const py::array &sigma, const py::array &occupancy,
+      const py::array &region, const py::array &charge) {
+    const py::ssize_t n = element.ndim() == 1 ? element.shape(0) : -1;
+    auto e = atom_column<int>(element, "element", true, -1);
+    auto px = atom_column<double>(x, "x", false, n);
+    auto py_ = atom_column<double>(y, "y", false, n);
+    auto pz = atom_column<double>(z, "z", false, n);
+    auto ps = atom_column<double>(sigma, "sigma", false, n);
+    auto po = atom_column<double>(occupancy, "occupancy", false, n);
+    auto pr = atom_column<int>(region, "region", true, n);
+    auto pc = atom_column<int>(charge, "charge", true, n);
+    const int *E = e.data(), *Rg = pr.data(), *C = pc.data();
+    const double *X = px.data(), *Y = py_.data(), *Z = pz.data();
+    const double *S = ps.data(), *O = po.data();
+    std::vector<multem::Atom> atoms(static_cast<std::size_t>(n));
+    {
+      py::gil_scoped_release release;
+      for (py::ssize_t i = 0; i < n; ++i) {
+        atoms[i] = multem::Atom(E[i], X[i], Y[i], Z[i], S[i], O[i], Rg[i], C[i]);
+      }
+    }
+    return atoms;
+  }
+
+  /**
    * An iterator wrapper that extracts the pybind iterator into the desired 
    * C++ type. Importantly, the GIL is acquired whenever python code is called.
    */
@@ -1028,7 +1091,15 @@ PYBIND11_MODULE(multem_ext, m)
 {
 
   // Wrap the vector of atoms
-  py::bind_vector<std::vector<multem::Atom>>(m, "AtomList");
+  py::bind_vector<std::vector<multem::Atom>>(m, "AtomList")
+    .def_static("from_arrays", &py::detail::AtomList_from_arrays,
+                "Build an atom list from eight 1-D columns: the same atoms as\n"
+                "AtomList(zip(element, x, y, z, sigma, occupancy, region, charge)),\n"
+                "without converting each atom through Python. Integer columns\n"
+                "(element, region, charge) must have an integer dtype.",
+                py::arg("element"), py::arg("x"), py::arg("y"), py::arg("z"),
+                py::arg("sigma"), py::arg("occupancy"), py::arg("region"),
+                py::arg("charge"));
 
   // Wrap the multem::CrystalParameters class
   py::class_<multem::CrystalParameters>(m, "CrystalParameters")
