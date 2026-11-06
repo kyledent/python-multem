@@ -21,6 +21,8 @@
 #include <xtl_build.hpp>
 #include <output_multislice.hpp>
 #include <tem_simulation.cuh>
+#include <atomic_data.hpp>
+#include <bandlimited_potential.hpp>
 #include <fftw3.h>
 #include <multem/multem_ext.h>
 
@@ -943,9 +945,12 @@ namespace multem {
       double ysize;
       double x_pixel_size;
       double y_pixel_size;
+      double dR_bl;
 
       /**
-       * Initialise
+       * Initialise. dR_bl > 0 multiplies the amplitude by the band-limit window
+       * of a grid of that spacing (MULTEM's bandlimited_potential.hpp), so that
+       * the field has the spectrum band-limited atoms would give it.
        */
       ComputeGaussianRandomFieldAmplitude(
             double a1_,
@@ -957,7 +962,8 @@ namespace multem {
             size_t xsize_, 
             size_t ysize_,
             double x_pixel_size_,
-            double y_pixel_size_)
+            double y_pixel_size_,
+            double dR_bl_ = 0)
         : a1(a1_),
           a2(a2_),
           m1(m1_),
@@ -967,7 +973,8 @@ namespace multem {
           xsize(xsize_),
           ysize(ysize_),
           x_pixel_size(x_pixel_size_),
-          y_pixel_size(y_pixel_size_) {
+          y_pixel_size(y_pixel_size_),
+          dR_bl(dR_bl_) {
         MULTEM_ASSERT(a1 > 0);    
         MULTEM_ASSERT(a2 > 0);    
         MULTEM_ASSERT(s1 > 0);    
@@ -993,9 +1000,100 @@ namespace multem {
         double power = 
           a1 * exp(-0.5*(r-m1)*(r-m1)/(s1*s1)) +
           a2 * exp(-0.5*(r-m2)*(r-m2)/(s2*s2));
-        return sqrt(power);
+        double amplitude = sqrt(power);
+        if (dR_bl > 0) {
+          amplitude *= mt::bandlimit::window(r, dR_bl);
+        }
+        return amplitude;
       }
     };
+
+    /**
+     * Band-limited atoms and the random field that stands in for them.
+     *
+     * With MULTEM_BANDLIMITED_POTENTIAL=1, MULTEM tabulates each atom's
+     * projected potential band-limited to the grid (bandlimited_potential.hpp
+     * in MULTEM), and an atom then deposits all of it whatever the pixel size.
+     * The random field that stands in for water must do the same, so:
+     *
+     *  - its mean needs no pixel-size correction, and its scale M0 is the
+     *    integral of the projected potential of one water molecule, from the
+     *    same scattering factors the atoms use;
+     *
+     *  - its variance is the part of its own power spectrum P(q) that the band
+     *    passes, int P W^2 d^2q / int P d^2q, and its amplitude carries W too.
+     *
+     * The power spectrum stands for that of projected water, correlations
+     * included (its second term peaks at the first diffraction ring), so the
+     * fraction is computed from it rather than from independent atoms.
+     */
+    inline bool band_limited_potential() {
+      return mt::bandlimit::enabled();
+    }
+
+    inline double band_limit_spacing(double x_pixel_size, double y_pixel_size) {
+      return mt::bandlimit::band_spacing(x_pixel_size, y_pixel_size);
+    }
+
+    /**
+     * c_Potf (f_e,O(0) + 2 f_e,H(0)): the projected-potential integral of one
+     * water molecule, V A^3, with the Lobato scattering factors Parakeet uses.
+     */
+    inline double water_projected_potential_integral() {
+      static const double value = []() {
+        mt::Atomic_Data atomic_data(mt::ePT_Lobato_0_12);
+        double sum = 0;
+        for (int Z : {8, 1, 1}) {
+          mt::Atom_Type<double, mt::e_host> atom_type;
+          atomic_data.To_atom_type_CPU(Z, mt::c_Vrl, mt::c_nR, 1.0, atom_type);
+          mt::Atom_Cal<double> atom_cal;
+          atom_cal.Set_Atom_Type(mt::ePT_Lobato_0_12, 0, &atom_type);
+          double fe0 = 0;
+          atom_cal.feg(0.0, fe0);
+          sum += mt::c_Potf * fe0;
+        }
+        return sum;
+      }();
+      return value;
+    }
+
+    /**
+     * int P W^2 q dq / int P q dq for the two-Gaussian power spectrum
+     * P(q) = a1 G(q; m1, s1) + a2 G(q; m2, s2) and the window W of a grid of
+     * spacing dR. The denominator is analytic; the numerator is integrated with
+     * a Gauss-Legendre rule on each side of the window's kink at half Nyquist.
+     */
+    inline double band_limited_variance_fraction(
+        double a1, double a2, double m1, double m2, double s1, double s2, double dR) {
+      auto power = [&](double q) {
+        return a1 * std::exp(-0.5*(q-m1)*(q-m1)/(s1*s1))
+             + a2 * std::exp(-0.5*(q-m2)*(q-m2)/(s2*s2));
+      };
+      // int_0^inf q exp(-(q-m)^2 / (2 s^2)) dq
+      auto moment = [](double m, double s) {
+        return s*s*std::exp(-0.5*m*m/(s*s))
+             + m*s*std::sqrt(0.5*M_PI)*(1 + std::erf(m/(s*std::sqrt(2.0))));
+      };
+      double total = a1 * moment(m1, s1) + a2 * moment(m2, s2);
+      MULTEM_ASSERT(total > 0);
+
+      double q_nyq = 0.5 / dR;
+      double edges[3] = {
+        0.0,
+        mt::bandlimit::c_q1_frac * q_nyq,
+        mt::bandlimit::c_q2_frac * q_nyq
+      };
+      double band = 0;
+      std::vector<double> xq, wq;
+      for (int i = 0; i < 2; ++i) {
+        mt::bandlimit::gauss_legendre(256, edges[i], edges[i+1], xq, wq);
+        for (std::size_t k = 0; k < xq.size(); ++k) {
+          double W = mt::bandlimit::window(xq[k], dR);
+          band += wq[k] * xq[k] * power(xq[k]) * W * W;
+        }
+      }
+      return band / total;
+    }
 
     /**
      * Compute the FT of the Gaussian Random Field
@@ -1228,7 +1326,10 @@ namespace multem {
                 xsize, 
                 ysize,
                 x_pixel_size_,
-                y_pixel_size_));
+                y_pixel_size_,
+                band_limited_potential()
+                  ? band_limit_spacing(x_pixel_size_, y_pixel_size_)
+                  : 0.0));
         }
 
         // We get two random fields for one calculation so we either use the
@@ -1292,6 +1393,10 @@ namespace multem {
        * Compute the mean
        */
       double compute_mean(double density) const {
+        if (band_limited_potential()) {
+          // band-limited atoms keep their whole integral at any pixel size
+          return water_projected_potential_integral() * density;
+        }
         //double M0 = 147.82; // Computed from MD water model
         double M0 = 145.59; // Computed from MD water model
         double Cv = compute_mean_correction(x_pixel_size_*y_pixel_size_);
@@ -1306,7 +1411,10 @@ namespace multem {
         /* double V0 = 10784.46; // Computed by calibrating agaist MD water model */
         // double V0 = 10233.70; // Computed by calibrating agaist MD water model
         double V0 = 10195.82; // Computed by calibrating agaist MD water model
-        double Cv = compute_variance_correction(x_pixel_size_*y_pixel_size_);
+        double Cv = band_limited_potential()
+          ? band_limited_variance_fraction(a1_, a2_, m1_, m2_, s1_, s2_,
+              band_limit_spacing(x_pixel_size_, y_pixel_size_))
+          : compute_variance_correction(x_pixel_size_*y_pixel_size_);
         double var = V0 * Cv * density;
         MULTEM_ASSERT(var > 0);
         return std::sqrt(var);
@@ -1600,24 +1708,33 @@ namespace multem {
        * Compute mean potential for a region, using m0 override if set.
        */
       double compute_mean(double n_particles, double m0_override) const {
+        if (band_limited_potential()) {
+          // band-limited atoms keep their whole integral at any pixel size
+          double M0 = (m0_override >= 0) ? m0_override : water_projected_potential_integral();
+          return M0 * n_particles;
+        }
         double M0 = (m0_override >= 0) ? m0_override : 145.59;
         double pixel_area = x_pixel_size_ * y_pixel_size_;
-        // Reuse the water correction table (geometry-dependent, not material-specific)
+        // Reuse water's correction table. It is only an approximation for another material:
+        // MULTEM's own tables lose a share of each atom's potential that depends on the element.
         double Cv = compute_mean_correction(pixel_area);
         return M0 * Cv * n_particles;
       }
 
-      double compute_sigma(double n_particles, double v0_override) const {
+      double compute_sigma(double n_particles, double v0_override, const RegionState &reg) const {
         double V0 = (v0_override >= 0) ? v0_override : 10195.82;
         double pixel_area = x_pixel_size_ * y_pixel_size_;
-        double Cv = compute_variance_correction(pixel_area);
+        double Cv = band_limited_potential()
+          ? band_limited_variance_fraction(reg.a1, reg.a2, reg.m1, reg.m2, reg.s1, reg.s2,
+              band_limit_spacing(x_pixel_size_, y_pixel_size_))
+          : compute_variance_correction(pixel_area);
         double var = V0 * Cv * n_particles;
         MULTEM_ASSERT(var > 0);
         return std::sqrt(var);
       }
 
-      // Reuse the water correction lookup tables from IcePotentialApproximation.
-      // These are geometry-dependent (pixel area averaging), not material-specific.
+      // Water's correction lookup tables, as in IcePotentialApproximation, for MULTEM's own
+      // (not band-limited) atom tables.
 
       double compute_mean_correction(double pixel_area) const {
         std::vector<double> X = {
@@ -1695,7 +1812,10 @@ namespace multem {
               reg.amplitude.begin(),
               ComputeGaussianRandomFieldAmplitude<T_r>(
                 reg.a1, reg.a2, reg.m1, reg.m2, reg.s1, reg.s2,
-                xsize, ysize, x_pixel_size_, y_pixel_size_));
+                xsize, ysize, x_pixel_size_, y_pixel_size_,
+                band_limited_potential()
+                  ? band_limit_spacing(x_pixel_size_, y_pixel_size_)
+                  : 0.0));
         }
 
         // Generate two random fields per FFT (real + imag)
@@ -1765,7 +1885,7 @@ namespace multem {
           // Compute GRF statistics for this material
           double number_density = compute_number_density_of_water(reg.density);
           double mean = compute_mean(thickness * number_density, reg.m0);
-          double sigma = compute_sigma(thickness * number_density, reg.v0);
+          double sigma = compute_sigma(thickness * number_density, reg.v0, reg);
 
           // Generate and mask the GRF
           compute_grf_for_region(reg, mean, sigma);

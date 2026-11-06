@@ -109,6 +109,34 @@ def _apply_performance_defaults():
 _apply_performance_defaults()
 
 
+# Band-limited atomic potentials.
+#
+# MULTEM samples each atom's projected potential at pixel centres from a radial table that starts
+# one pixel out from the atom, and extrapolates inside that. At cryo-EM sampling nearly all of the
+# potential lies inside, so most of it is lost -- about 85% for oxygen at 1.5 A/px -- in a share
+# that depends on the element. With this setting MULTEM tabulates instead the potential
+# band-limited to the grid, which an atom deposits in full at any pixel size and sub-pixel
+# position, and the ice random field follows suit (no pixel-size correction of its mean; its
+# variance the part of its spectrum the band passes). It CHANGES results, by correcting them. This
+# package turns it on unless you have set it yourself; "0" restores MULTEM's original tables and
+# the ice model's correction tables. See README.md.
+BAND_LIMITED_POTENTIAL = "MULTEM_BANDLIMITED_POTENTIAL"
+
+os.environ.setdefault(BAND_LIMITED_POTENTIAL, "1")
+
+
+def band_limited_potential():
+    """
+    Whether atomic potentials are band-limited to the grid (MULTEM_BANDLIMITED_POTENTIAL). Read
+    by MULTEM at each simulation, so a change takes effect from the next one.
+
+    """
+    try:
+        return int(os.environ.get(BAND_LIMITED_POTENTIAL, "0")) != 0
+    except ValueError:
+        return False
+
+
 from multem_ext import *  # noqa
 
 

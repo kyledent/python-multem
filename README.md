@@ -46,11 +46,42 @@ export CUDACXX=${PATH_TO_CUDA}/bin/nvcc
 python -m pip install -e .
 ```
 
+## Band-limited atomic potentials (this fork)
+
+This fork builds against the `band-limited-potential` branch of
+[kyledent/MULTEM](https://github.com/kyledent/MULTEM/tree/band-limited-potential) (the `MULTEM`
+submodule), which is the `performance-optimisation` branch (next section) plus a correction to how
+an atom's potential is put on the grid.
+
+MULTEM samples each atom's projected potential at pixel centres from a radial table that starts one
+pixel out from the atom, and extrapolates the table inwards for nearer pixels. At the pixel sizes used
+for cryo-EM almost all of an atom's projected potential lies inside that radius, so most of it is
+lost: oxygen keeps about 15% of it at 1.5 A/px, under 1% at 3 A/px. The share depends on the element
+(oxygen loses more than carbon, hydrogen or nitrogen), so mean inner potentials and the contrast
+between materials are both wrong. Binning a simulation afterwards keeps the deficit of the pixel size
+it was simulated at.
+
+With `MULTEM_BANDLIMITED_POTENTIAL=1` MULTEM tabulates instead each atom's projected potential
+low-pass filtered to the grid -- flat to half the Nyquist frequency, a raised cosine to zero at
+Nyquist. A function with nothing at or beyond twice Nyquist sums on the grid to its integral, so
+every atom deposits its whole projected potential at any pixel size and any sub-pixel position, and
+nothing above Nyquist aliases. The ice model follows suit: its mean is the projected-potential
+integral of a water molecule times the number of molecules, with no pixel-size correction, its
+variance is the part of its power spectrum that the band passes, and its spectrum carries the same
+window.
+
+**python-multem turns this on at import, unless you have set the variable yourself.** It changes
+results, by correcting them. Set `MULTEM_BANDLIMITED_POTENTIAL=0` to get MULTEM's original tables and
+the ice model's original correction tables back. `multem.band_limited_potential()` reports the setting
+in effect. Only neutral atoms are band-limited; ions keep the original tables. Each atom's table
+reaches at least 8 pixels, to keep the filter's ringing, so at 1.5 A/px the potential is evaluated at
+about 200 pixels per atom instead of 13.
+
 ## Performance settings (this fork)
 
-This fork builds against the `performance-optimisation` branch of
-[kyledent/MULTEM](https://github.com/kyledent/MULTEM/tree/performance-optimisation) (the `MULTEM`
-submodule). Besides its GPU work, that branch moves the host-side preparation of a simulation --
+The `performance-optimisation` branch of
+[kyledent/MULTEM](https://github.com/kyledent/MULTEM/tree/performance-optimisation), which the
+branch above builds on, has GPU work and also moves the host-side preparation of a simulation --
 sorting the atoms by z, copying them into place, computing their statistics, identifying the slicing
 planes -- onto several CPU threads, and removes work that was repeated. **Every change reproduces the
 original results bit for bit**, and each can be checked in place (below).
