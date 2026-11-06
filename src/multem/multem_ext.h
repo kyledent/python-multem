@@ -825,6 +825,12 @@ namespace multem {
   bool is_gpu_available();
 
   /**
+   * The band-limited potential's spacing for these pixel sizes (A), as compiled
+   * into this engine.
+   */
+  double band_limit_spacing(double x_pixel_size, double y_pixel_size);
+
+  /**
    * @returns The number of available GPUs
    */
   int number_of_gpu_available();

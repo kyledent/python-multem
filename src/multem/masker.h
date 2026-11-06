@@ -1563,6 +1563,22 @@ namespace multem {
       ice_parameters_ = ice_parameters;
     }
 
+    /**
+     * Seed the ice's random field. A seed >= 0 makes the field the same on
+     * every simulation that uses this masker with the same slicing; a negative
+     * seed (the default, -1) draws a fresh field each time, as before.
+     */
+    void set_seed(long long seed) {
+      seed_ = seed;
+    }
+
+    /**
+     * The random-field seed (negative: unseeded)
+     */
+    long long seed() const {
+      return seed_;
+    }
+
   protected:
 
     Shape shape_;
@@ -1570,6 +1586,7 @@ namespace multem {
     CylinderMasker cylinder_masker_;
     SphereMasker sphere_masker_;
     IceParameters ice_parameters_;
+    long long seed_ = -1;
   };
 
 
@@ -1690,11 +1707,28 @@ namespace multem {
       }
     }
 
+    /**
+     * Seed the random field shared by all regions (drawn in region order). A
+     * seed >= 0 makes it reproducible; negative (the default, -1) draws a fresh
+     * field each time, as before. The regions' own Masker seeds are not used.
+     */
+    void set_seed(long long seed) {
+      seed_ = seed;
+    }
+
+    /**
+     * The random-field seed (negative: unseeded)
+     */
+    long long seed() const {
+      return seed_;
+    }
+
   private:
     std::size_t xsize_;
     std::size_t ysize_;
     double pixel_size_;
     std::vector<MaskerRegion> regions_;
+    long long seed_ = -1;
   };
 }
 

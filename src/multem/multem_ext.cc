@@ -1356,6 +1356,9 @@ PYBIND11_MODULE(multem_ext, m)
     .def("set_rotation", &multem::Masker::set_rotation)
     .def("set_translation", &multem::Masker::set_translation)
     .def("set_ice_parameters", &multem::Masker::set_ice_parameters)
+    .def("set_seed", &multem::Masker::set_seed, py::arg("seed"),
+         "Seed the ice's random field: >= 0 reproducible, negative (default -1) fresh each time")
+    .def("seed", &multem::Masker::seed)
     .def("compute", &pybind11::detail::Masker_compute)
     ;
 
@@ -1390,6 +1393,9 @@ PYBIND11_MODULE(multem_ext, m)
          py::arg("material"),
          py::arg("subtract_regions") = std::vector<int>())
     .def("num_regions", &multem::MultiRegionMasker::num_regions)
+    .def("set_seed", &multem::MultiRegionMasker::set_seed, py::arg("seed"),
+         "Seed the shared random field: >= 0 reproducible, negative (default -1) fresh each time")
+    .def("seed", &multem::MultiRegionMasker::seed)
     .def("region", &multem::MultiRegionMasker::region)
     .def("xsize", &multem::MultiRegionMasker::xsize)
     .def("ysize", &multem::MultiRegionMasker::ysize)
@@ -1438,6 +1444,9 @@ PYBIND11_MODULE(multem_ext, m)
 
   // Expose the GPU functions
   m.def("is_gpu_available", &multem::is_gpu_available);
+  m.def("band_limit_spacing", &multem::band_limit_spacing,
+        py::arg("x_pixel_size"), py::arg("y_pixel_size"),
+        "The band-limited potential's spacing (A) for these pixel sizes, from the compiled engine");
   m.def("number_of_gpu_available", &multem::number_of_gpu_available);
 
   m.def("mrad_to_sigma", &multem::mrad_to_sigma);

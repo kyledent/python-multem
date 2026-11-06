@@ -1036,6 +1036,32 @@ namespace multem {
     }
 
     /**
+     * The random engine for a random-field seed. thrust's default engine is
+     * minstd_rand, whose state is 1 .. 2^31-2: the seed is taken modulo 2^31-1
+     * and 0 becomes 1, so seeds that differ by a multiple of 2^31-1, and the
+     * seeds 0 and 1, give the same field. Callers that need distinct fields
+     * should pass seeds in 1 .. 2^31-2.
+     */
+    inline thrust::default_random_engine seeded_random_engine(long long seed) {
+      const long long m = 2147483647LL;
+      long long s = seed % m;
+      if (s <= 0) {
+        s = (s == 0) ? 1 : s + m;
+      }
+      return thrust::default_random_engine(static_cast<unsigned int>(s));
+    }
+
+    /**
+     * Seed a potential function's random field from its masker, if seeded.
+     */
+    template <typename PotentialFunction, typename MaskerType>
+    void seed_from_masker(PotentialFunction &potential_function, const MaskerType &masker) {
+      if (masker.seed() >= 0) {
+        potential_function.set_random_engine(seeded_random_engine(masker.seed()));
+      }
+    }
+
+    /**
      * c_Potf (f_e,O(0) + 2 f_e,H(0)): the projected-potential integral of one
      * water molecule, V A^3, with the Lobato scattering factors Parakeet uses.
      */
@@ -1995,6 +2021,7 @@ namespace multem {
       potential_function.set_fft_2d(&fft_2d);
       potential_function.set_grid(input_multislice.grid_2d);
       potential_function.set_masker(masker);
+      seed_from_masker(potential_function, masker);
       potential_function.set_pixel_size(x_pixel_size, y_pixel_size);
       multislice.set_potential_function(&potential_function);
 
@@ -2056,6 +2083,7 @@ namespace multem {
       MultiMaterialPotentialApproximation<FloatType, DeviceType> potential_function;
       potential_function.set_fft_2d(&fft_2d);
       potential_function.set_masker(masker);
+      seed_from_masker(potential_function, masker);
       potential_function.set_grid(input_multislice.grid_2d);
       potential_function.set_pixel_size(x_pixel_size, y_pixel_size);
       multislice.set_potential_function(&potential_function);
@@ -2183,6 +2211,7 @@ namespace multem {
       potential_function.set_fft_2d(&fft_2d);
       potential_function.set_grid(input_multislice.grid_2d);
       potential_function.set_masker(masker);
+      seed_from_masker(potential_function, masker);
       potential_function.set_pixel_size(x_pixel_size, y_pixel_size);
       
       // Set the input data
@@ -3080,6 +3109,10 @@ namespace multem {
 
   bool is_gpu_available() {
     return mt::is_gpu_available();
+  }
+
+  double band_limit_spacing(double x_pixel_size, double y_pixel_size) {
+    return detail::band_limit_spacing(x_pixel_size, y_pixel_size);
   }
 
   int number_of_gpu_available() {
