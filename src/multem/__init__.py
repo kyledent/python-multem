@@ -16,7 +16,99 @@ except ImportError:
     __version__ = "unknown"
 
 
+import os
+import warnings
+
 import numpy
+
+
+# Host-side performance settings.
+#
+# The MULTEM this package builds against can run the host-side preparation of a simulation --
+# sorting the atoms by z, copying them into place, their statistics, plane identification -- on
+# several CPU threads, and skip work that was repeated. Every one of these reproduces the original
+# results bit for bit. MULTEM selects each by an environment variable it reads at call time; this
+# package turns them on unless you have set them yourself ("0" switches one off). See README.md.
+PERFORMANCE_TOGGLES = (
+    "MULTEM_FAST_SETUP",
+    "MULTEM_SKIP_REDUNDANT_STATS",
+    "MULTEM_PAR_SORT",
+    "MULTEM_PAR_COPY",
+    "MULTEM_REUSE_CONF",
+    "MULTEM_FAST_PLANES",
+)
+
+DEFAULT_THREAD_FRACTION = 0.75
+
+
+def available_cpus():
+    """
+    The number of CPUs this process may run on: its affinity mask where the operating system
+    provides one (so a batch slot or container limited to some cores is respected), otherwise
+    the number of CPUs in the machine.
+
+    """
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
+def default_num_threads(fraction=DEFAULT_THREAD_FRACTION):
+    """
+    The default number of host threads: a fraction (75%) of the available CPUs, at least one.
+
+    """
+    return max(1, int(available_cpus() * fraction))
+
+
+def set_num_threads(n):
+    """
+    Set the number of host threads MULTEM's parallel setup steps use. Takes effect from the next
+    simulation.
+
+    Args:
+        n (int): The number of threads, at least one
+
+    """
+    n = int(n)
+    if n < 1:
+        raise ValueError("the number of threads must be at least 1, got %d" % n)
+    os.environ["MULTEM_NUM_THREADS"] = str(n)
+
+
+def get_num_threads():
+    """
+    The number of host threads MULTEM's parallel setup steps will use.
+
+    """
+    return int(os.environ["MULTEM_NUM_THREADS"])
+
+
+def _apply_performance_defaults():
+    for name in PERFORMANCE_TOGGLES:
+        os.environ.setdefault(name, "1")
+    # MULTEM ignores a value that is not a positive integer and falls back to its own default,
+    # which would make get_num_threads() report a number that is not in use -- so replace it.
+    value = os.environ.get("MULTEM_NUM_THREADS")
+    if value is not None:
+        try:
+            valid = int(value) >= 1
+        except ValueError:
+            valid = False
+        if not valid:
+            warnings.warn(
+                "MULTEM_NUM_THREADS=%r is not a positive integer; using %d"
+                % (value, default_num_threads())
+            )
+            value = None
+    if value is None:
+        os.environ["MULTEM_NUM_THREADS"] = str(default_num_threads())
+
+
+_apply_performance_defaults()
+
+
 from multem_ext import *  # noqa
 
 

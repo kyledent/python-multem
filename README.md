@@ -46,6 +46,63 @@ export CUDACXX=${PATH_TO_CUDA}/bin/nvcc
 python -m pip install -e .
 ```
 
+## Performance settings (this fork)
+
+This fork builds against the `performance-optimisation` branch of
+[kyledent/MULTEM](https://github.com/kyledent/MULTEM/tree/performance-optimisation) (the `MULTEM`
+submodule). Besides its GPU work, that branch moves the host-side preparation of a simulation --
+sorting the atoms by z, copying them into place, computing their statistics, identifying the slicing
+planes -- onto several CPU threads, and removes work that was repeated. **Every change reproduces the
+original results bit for bit**, and each can be checked in place (below).
+
+To install this fork:
+
+```sh
+export CUDACXX=${PATH_TO_CUDA}/bin/nvcc
+python -m pip install git+https://github.com/kyledent/python-multem.git@multi-region-masker
+```
+
+On import, python-multem turns these optimisations on, unless you have set the variable yourself:
+
+| variable | what it does |
+|---|---|
+| `MULTEM_FAST_SETUP` | compute the atom statistics in one pass instead of about a dozen |
+| `MULTEM_SKIP_REDUNDANT_STATS` | the second copy of the atoms reuses the statistics it would recompute |
+| `MULTEM_PAR_SORT` | sort the atoms by z on several threads |
+| `MULTEM_PAR_COPY` | copy the atoms into place on several threads |
+| `MULTEM_REUSE_CONF` | skip rebuilding an atom configuration that is already in place (still atoms) |
+| `MULTEM_FAST_PLANES` | skip re-sorting plane positions that are already in order |
+
+Set any of them to `0` before importing `multem` to switch it off.
+
+### Number of threads
+
+By default python-multem uses **75% of the CPUs this process may run on** (at least one) — counted
+from the process's affinity mask where the operating system provides one, so a batch slot or a
+container limited to some cores is respected. To choose, in order of precedence:
+
+1. `multem.set_num_threads(n)` — at any time; it applies from the next simulation.
+2. The environment variable `MULTEM_NUM_THREADS`, set before `multem` is imported — the useful place
+   when python-multem is driven by another program, since that program needs no change:
+
+   ```sh
+   MULTEM_NUM_THREADS=8 python my_simulation.py
+   ```
+
+3. Otherwise `multem.default_num_threads()`, i.e. 75% of `multem.available_cpus()`.
+
+`multem.get_num_threads()` reports the value in effect. More threads is not always faster: these
+steps are largely memory-bound, and the measured gains flatten beyond about 8 to 16 threads.
+`SystemConfiguration.cpu_nthread` is unrelated — it sets the threads of MULTEM's CPU-only
+(`device = "host"`) simulation mode.
+
+### Checking the results
+
+Each optimisation can be run against the original code path in the same process. These are slower —
+for verification, not production — and each prints a `[check]` line to stderr counting any
+difference (it should be 0): `MULTEM_SORT_CHECK=1`, `MULTEM_COPY_CHECK=1`, `MULTEM_REUSE_CHECK=1`,
+`MULTEM_PLANES_CHECK=1`.
+
 ## Testing
 
 To run the tests, follow the installation instructions and execute the following:
