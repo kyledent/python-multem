@@ -96,6 +96,32 @@ def test_settings_reach_multem():
     assert int(m.group(3)) == 0
 
 
+@pytest.mark.parametrize("band_limited", ["1", "0"])
+@pytest.mark.parametrize(
+    "potential_type",
+    ["Doyle_0_4", "Peng_0_4", "Peng_0_12", "Kirkland_0_12", "Weickenmeier_0_12", "Lobato_0_12"],
+)
+def test_atom_type_cache_reaches_multem(potential_type, band_limited):
+    # Two simulations on one grid in one process: the second takes the atom-type tables from the
+    # cache. MULTEM_ATOM_TYPE_CACHE_CHECK=1 makes MULTEM rebuild them anyway on that hit and print
+    # how many values differ from the cached copy -- which must be none.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MULTEM_")}
+    env["MULTEM_ATOM_TYPE_CACHE_CHECK"] = "1"
+    env["MULTEM_BANDLIMITED_POTENTIAL"] = band_limited
+    code = _SIMULATE.replace('"Lobato_0_12"', repr(potential_type))
+    code += "multem.simulate(system_conf, inp)\n"
+    run = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=900
+    )
+    assert run.returncode == 0, run.stderr[-2000:]
+    checks = [line for line in run.stderr.splitlines() if "[check] atom_type cache" in line]
+    assert len(checks) == 1, run.stderr[-2000:]
+    m = re.search(r"(\d+) atom types, (\d+) values differ", checks[0])
+    assert m, checks[0]
+    assert int(m.group(1)) == 103
+    assert int(m.group(2)) == 0
+
+
 def test_set_num_threads():
     before = multem.get_num_threads()
     try:

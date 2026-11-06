@@ -103,6 +103,7 @@ On import, python-multem turns these optimisations on, unless you have set the v
 | `MULTEM_PAR_COPY` | copy the atoms into place on several threads |
 | `MULTEM_REUSE_CONF` | skip rebuilding an atom configuration that is already in place (still atoms) |
 | `MULTEM_FAST_PLANES` | skip re-sorting plane positions that are already in order |
+| `MULTEM_ATOM_TYPE_CACHE` | build the atom-type coefficient tables once per process for each potential type, grid spacing and band limit, and reuse them in later simulations |
 
 Set any of them to `0` before importing `multem` to switch it off.
 
