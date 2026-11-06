@@ -122,6 +122,45 @@ def test_atom_type_cache_reaches_multem(potential_type, band_limited):
     assert int(m.group(2)) == 0
 
 
+def test_atom_type_cache_across_precision_and_device():
+    # One process alternating float and double, and host and GPU when there is one. Float and
+    # double tables are cached separately, and the tables are host tables whatever the device, so
+    # every simulation after the first of each precision is a hit -- and must match a fresh build.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MULTEM_")}
+    env["MULTEM_ATOM_TYPE_CACHE_CHECK"] = "1"
+    code = _SIMULATE.replace("multem.simulate(system_conf, inp)\n", "")
+    code += """
+import sys
+devices = ["host", "device"] if multem.is_gpu_available() else ["host"]
+runs = [(d, p) for d in devices for p in ("float", "double")] + [("host", "float"), ("host", "double")]
+for device, precision in runs:
+    system_conf.device = device
+    system_conf.precision = precision
+    multem.simulate(system_conf, inp)
+    sys.stderr.write("@@RUN %s %s\\n" % (device, precision))
+"""
+    run = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=900
+    )
+    assert run.returncode == 0, run.stderr[-2000:]
+    # per run, in order: (device, precision) and the check results printed during it
+    runs, pending = [], []
+    for line in run.stderr.splitlines():
+        if "[check] atom_type cache" in line:
+            m = re.search(r"(\d+) atom types, (\d+) values differ", line)
+            assert m, line
+            pending.append((int(m.group(1)), int(m.group(2))))
+        elif line.startswith("@@RUN "):
+            runs.append((tuple(line.split()[1:]), pending))
+            pending = []
+    assert len(runs) in (4, 6), run.stderr[-2000:]
+    # the first float and the first double simulation miss; every later one is a checked hit
+    assert runs[0][1] == [] and runs[1][1] == [], runs
+    for key, checks in runs[2:]:
+        assert checks == [(103, 0)], (key, checks)
+    print("simulations:", [key for key, _ in runs])
+
+
 def test_set_num_threads():
     before = multem.get_num_threads()
     try:
