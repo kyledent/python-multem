@@ -12,6 +12,7 @@
 #include <sstream>
 #include <iostream>
 #include <stdexcept>
+#include <array>
 #include <map>
 #include <string>
 #include <cuda_runtime.h>
@@ -1089,7 +1090,7 @@ namespace multem {
      * spacing dR. The denominator is analytic; the numerator is integrated with
      * a Gauss-Legendre rule on each side of the window's kink at half Nyquist.
      */
-    inline double band_limited_variance_fraction(
+    inline double band_limited_variance_fraction_uncached(
         double a1, double a2, double m1, double m2, double s1, double s2, double dR) {
       auto power = [&](double q) {
         return a1 * std::exp(-0.5*(q-m1)*(q-m1)/(s1*s1))
@@ -1119,6 +1120,28 @@ namespace multem {
         }
       }
       return band / total;
+    }
+
+    /**
+     * The fraction depends only on the power spectrum and the grid spacing, which
+     * are the same for every slice, but the ice asks for it once per slice and each
+     * evaluation rebuilds two 256-point Gauss-Legendre rules. Remember the values
+     * per thread; the result is the same computation, so it is unchanged.
+     */
+    inline double band_limited_variance_fraction(
+        double a1, double a2, double m1, double m2, double s1, double s2, double dR) {
+      thread_local std::map<std::array<double, 7>, double> cache;
+      const std::array<double, 7> key = {a1, a2, m1, m2, s1, s2, dR};
+      auto it = cache.find(key);
+      if (it != cache.end()) {
+        return it->second;
+      }
+      if (cache.size() > 256) {
+        cache.clear();
+      }
+      double value = band_limited_variance_fraction_uncached(a1, a2, m1, m2, s1, s2, dR);
+      cache.emplace(key, value);
+      return value;
     }
 
     /**
