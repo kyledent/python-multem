@@ -31,7 +31,7 @@ def cases():
         c = rng.uniform(-50, N * DR + 50, 3)
         r = rng.uniform(3, 300)
         out.append((tuple(c), float(r)))
-    # surface exactly through pixel centres: (i + 0.5) * DR from the centre
+    # surface exactly through grid points: i * DR from the centre
     out.append(((100.0 * DR, 100.0 * DR, 30.0), 20 * DR))
     return out
 

@@ -661,8 +661,8 @@ namespace multem {
         size_t j = index - i * ysize;
 
         // The coordinate in microscope scape
-        double x = (i + 0.5) * pixel_size;
-        double y = (j + 0.5) * pixel_size;
+        double x = i * pixel_size;
+        double y = j * pixel_size;
         double z = zc;
          
         // Dot product u.x, v.x and w.x
@@ -752,8 +752,8 @@ namespace multem {
         size_t j = index - i * ysize;
 
         // The coordinate in microscope space
-        double Px = (i + 0.5) * pixel_size;
-        double Py = (j + 0.5) * pixel_size;
+        double Px = i * pixel_size;
+        double Py = j * pixel_size;
         double Pz = (zs + ze) / 2.0;
 
         // Compute the position along the cylinder
@@ -891,14 +891,14 @@ namespace multem {
         size_t j = index - i * ysize;
 #ifdef __CUDA_ARCH__
         // no fused multiply-adds: the host loop's rounding, so pixels on the surface agree
-        double dx = __dadd_rn(__dmul_rn(i + 0.5, pixel_size), -cx);
+        double dx = __dadd_rn(__dmul_rn((double)i, pixel_size), -cx);
         double dx2 = __dmul_rn(dx, dx);
-        double dy = __dadd_rn(__dmul_rn(j + 0.5, pixel_size), -cy);
+        double dy = __dadd_rn(__dmul_rn((double)j, pixel_size), -cy);
         return (__dadd_rn(__dadd_rn(dx2, __dmul_rn(dy, dy)), dz2) <= r2);
 #else
-        double dx = (i + 0.5) * pixel_size - cx;
+        double dx = i * pixel_size - cx;
         double dx2 = dx * dx;
-        double dy = (j + 0.5) * pixel_size - cy;
+        double dy = j * pixel_size - cy;
         return (dx2 + dy * dy + dz2 <= r2);
 #endif
       }

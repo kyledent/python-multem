@@ -538,8 +538,8 @@ namespace multem {
           for (std::size_t j = 0; j < ysize_; ++j) {
 
             // The coordinate in microscope scape
-            double x = (i + 0.5) * pixel_size_;
-            double y = (j + 0.5) * pixel_size_;
+            double x = i * pixel_size_;
+            double y = j * pixel_size_;
             double z = zc;
 
 
@@ -718,12 +718,12 @@ namespace multem {
         double dz2 = dz * dz;
 
         for (std::size_t i = 0; i < xsize_; ++i) {
-          double x = (i + 0.5) * pixel_size_;
+          double x = i * pixel_size_;
           double dx = x - centre_m_[0];
           double dx2 = dx * dx;
 
           for (std::size_t j = 0; j < ysize_; ++j) {
-            double y = (j + 0.5) * pixel_size_;
+            double y = j * pixel_size_;
             double dy = y - centre_m_[1];
 
             *iterator = (dx2 + dy * dy + dz2 <= r2);
@@ -1167,8 +1167,8 @@ namespace multem {
         for (std::size_t j = 0; j < ysize_; ++j) {
 
           // The coordinate in microscope space
-          double Px = (i + 0.5) * pixel_size_;
-          double Py = (j + 0.5) * pixel_size_;
+          double Px = i * pixel_size_;
+          double Py = j * pixel_size_;
           double Pz = (zs + ze) / 2.0;
 
           // Compute the position along the cylinder
