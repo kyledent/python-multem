@@ -12,6 +12,8 @@
 #ifndef MULTEM_EXT_H
 #define MULTEM_EXT_H
 
+#include <tuple>
+#include <utility>
 #include <array>
 #include <cassert>
 #include <complex>
@@ -818,6 +820,23 @@ namespace multem {
       Input input, 
       const Masker &masker,
       projected_potential_callback callback);
+
+  /**
+   * The projected potential, slice by slice, with a multi-region masker's random fields added.
+   */
+  Output compute_projected_potential_with_multi_material(
+      SystemConfiguration config,
+      Input input,
+      const MultiRegionMasker &masker,
+      projected_potential_callback callback);
+
+  /**
+   * The (mean, sigma, band_limited) of the random-field potential the engine gives one slice of this
+   * material (V A per pixel), for these pixel sizes (A) and slice thickness (A); band_limited says
+   * which mode computed them (the band-limited potential, or the legacy pixel-area correction).
+   */
+  std::tuple<double, double, bool> ice_slice_statistics(
+      const IceParameters &ice, double x_pixel_size, double y_pixel_size, double thickness);
 
   /**
    * @returns True/False if the GPU is available

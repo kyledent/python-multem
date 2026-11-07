@@ -2340,6 +2340,40 @@ namespace multem {
     }
     
     /**
+     * The random-field potential for a masker type: the ice approximation for a Masker, the
+     * multi-material one for a MultiRegionMasker. Each is set up in the order its own simulate path
+     * uses, so the projected potential is the one the exit wave sees.
+     */
+    template <typename MaskerType, typename FloatType, mt::eDevice DeviceType>
+    struct potential_function_for;
+
+    template <typename FloatType, mt::eDevice DeviceType>
+    struct potential_function_for<Masker, FloatType, DeviceType> {
+      using type = IcePotentialApproximation<FloatType, DeviceType>;
+      static void setup(type &pf, const Masker &masker, mt::FFT<FloatType, DeviceType> *fft,
+                        const mt::Grid_2d<FloatType> &grid, double px, double py) {
+        pf.set_fft_2d(fft);
+        pf.set_grid(grid);
+        pf.set_masker(masker);
+        seed_from_masker(pf, masker);
+        pf.set_pixel_size(px, py);
+      }
+    };
+
+    template <typename FloatType, mt::eDevice DeviceType>
+    struct potential_function_for<MultiRegionMasker, FloatType, DeviceType> {
+      using type = MultiMaterialPotentialApproximation<FloatType, DeviceType>;
+      static void setup(type &pf, const MultiRegionMasker &masker, mt::FFT<FloatType, DeviceType> *fft,
+                        const mt::Grid_2d<FloatType> &grid, double px, double py) {
+        pf.set_fft_2d(fft);
+        pf.set_masker(masker);
+        seed_from_masker(pf, masker);
+        pf.set_grid(grid);
+        pf.set_pixel_size(px, py);
+      }
+    };
+
+    /**
      * Run the multislice simulation
      * @param system_conf The system configuration
      * @param input_multislice The input object
@@ -2374,13 +2408,10 @@ namespace multem {
       double x_pixel_size = input_multislice.atoms.l_x / input_multislice.grid_2d.nx;
       double y_pixel_size = input_multislice.atoms.l_y / input_multislice.grid_2d.ny;
 
-      // Setup the ice potential approximation
-      IcePotentialApproximation<FloatType, DeviceType> potential_function;
-      potential_function.set_fft_2d(&fft_2d);
-      potential_function.set_grid(input_multislice.grid_2d);
-      potential_function.set_masker(masker);
-      seed_from_masker(potential_function, masker);
-      potential_function.set_pixel_size(x_pixel_size, y_pixel_size);
+      // Setup the random-field potential for this masker type
+      using PF = potential_function_for<Masker, FloatType, DeviceType>;
+      typename PF::type potential_function;
+      PF::setup(potential_function, masker, &fft_2d, input_multislice.grid_2d, x_pixel_size, y_pixel_size);
       
       // Set the input data
       output_multislice.set_input_data(&input_multislice);
@@ -3169,6 +3200,43 @@ namespace multem {
       MULTEM_ASSERT(config.precision == "float" || config.precision == "double");
     }
     return result;
+  }
+
+  Output compute_projected_potential_with_multi_material(
+      SystemConfiguration config,
+      Input input,
+      const MultiRegionMasker &masker,
+      projected_potential_callback callback) {
+    Output result;
+    if (config.device == "host" && config.precision == "float") {
+      result = run_projected_potential<float, mt::e_host, MultiRegionMasker>(config, input, masker, callback);
+    } else if (config.device == "host" && config.precision == "double") {
+      result = run_projected_potential<double, mt::e_host, MultiRegionMasker>(config, input, masker, callback);
+#ifndef MULTEM_NO_CUDA
+    } else if (config.device == "device" && config.precision == "float") {
+      result = run_projected_potential<float, mt::e_device, MultiRegionMasker>(config, input, masker, callback);
+    } else if (config.device == "device" && config.precision == "double") {
+      result = run_projected_potential<double, mt::e_device, MultiRegionMasker>(config, input, masker, callback);
+#endif
+    } else {
+      MULTEM_ASSERT(config.device == "host" || config.device == "device");
+      MULTEM_ASSERT(config.precision == "float" || config.precision == "double");
+    }
+    return result;
+  }
+
+  std::tuple<double, double, bool> ice_slice_statistics(
+      const IceParameters &ice, double x_pixel_size, double y_pixel_size, double thickness) {
+    // the mean and sigma the engine gives one slice of this material, from the same members the
+    // simulation calls (band-limited switch, spectrum table, m0 and v0 included)
+    MULTEM_ASSERT(thickness > 0 && x_pixel_size > 0 && y_pixel_size > 0);
+    Masker masker(1, 1, x_pixel_size);
+    masker.set_ice_parameters(ice);
+    detail::IcePotentialApproximation<double, mt::e_host> pf;
+    pf.set_masker(masker);
+    pf.set_pixel_size(x_pixel_size, y_pixel_size);
+    double n = thickness * pf.compute_number_density_of_water(ice.density);
+    return std::make_tuple(pf.compute_mean(n), pf.compute_sigma(n), detail::band_limited_potential());
   }
 
   Image< std::complex<double> > compute_ctf(

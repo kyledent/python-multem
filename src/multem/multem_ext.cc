@@ -1450,6 +1450,17 @@ PYBIND11_MODULE(multem_ext, m)
       &multem::compute_projected_potential_with_ice_approximation, 
       py::call_guard<py::gil_scoped_release>());
   m.def(
+      "compute_projected_potential",
+      &multem::compute_projected_potential_with_multi_material,
+      py::call_guard<py::gil_scoped_release>());
+  m.def(
+      "ice_slice_statistics",
+      &multem::ice_slice_statistics,
+      py::arg("ice"), py::arg("x_pixel_size"), py::arg("y_pixel_size"), py::arg("thickness"),
+      "(mean, sigma, band_limited) of the random-field potential one slice of this material gets, "
+      "as the simulation computes them (spectrum table, m0 and v0 included); band_limited says "
+      "whether the band-limited potential or the legacy pixel-area correction was in force.");
+  m.def(
       "compute_ctf", 
       &multem::compute_ctf, 
       py::call_guard<py::gil_scoped_release>());
