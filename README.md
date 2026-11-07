@@ -77,6 +77,34 @@ in effect. Only neutral atoms are band-limited; ions keep the original tables. E
 reaches at least 8 pixels, to keep the filter's ringing, so at 1.5 A/px the potential is evaluated at
 about 200 pixels per atom instead of 13.
 
+## Ice and material regions (this fork)
+
+A `Masker` describes one region of random-field ice; a `MultiRegionMasker` several, each with its own
+material (`IceParameters`) and regions it subtracts.
+
+- **Grid.** Masks sample the same grid points as the atom potential, pixel i at x = i * dx (its corner).
+  Before, masks sampled pixel centres, so regions sat half a pixel from the atoms.
+- **Partial volume.** By default a slice takes a region wholly or not at all, by where the slice's
+  midpoint falls, so at normal incidence a region's path is a whole number of slices: off by up to a
+  slice per pair of faces. `set_partial_volume(n)` weights each pixel by the fraction of the slice inside
+  the region instead (n sub-slice samples; error at most dz/(2n) per face). The mean scales with the
+  fraction and the texture's variance with it too.
+- **Spectrum.** `IceParameters.set_spectrum_table(q, P)` replaces the two-Gaussian power spectrum with a
+  table (it needs the band-limited potential). `v0` is then the variance per molecule over the table's own
+  range.
+- **Vacuum.** A region with density 0 adds nothing, and other regions can still subtract its shape.
+- **Statistics.** `ice_slice_statistics(ice, dx, dy, dz)` returns the mean and sigma the engine gives one
+  slice of a material, and whether the band-limited potential was in force.
+
+Two behaviours inherited from upstream are worth knowing:
+
+- The ice is added at a third of its value wherever the atoms' potential is positive
+  (`AddRandomFieldAndPotential`), so atoms inside a region take away part of the ice under them.
+- The engine adds two hydrogen atoms at (0, 0, zmin) and (0, 0, zmax) of the masker to fix the slicing
+  range. Together with the previous point, that lowers the ice near the grid's corner in the slices at a
+  region's faces, so full-grid means of those slices include it. A render that crops its margin does not
+  keep those pixels.
+
 ## Performance settings (this fork)
 
 The `performance-optimisation` branch of
