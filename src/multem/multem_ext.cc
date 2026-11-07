@@ -1377,7 +1377,8 @@ PYBIND11_MODULE(multem_ext, m)
     .def("set_spectrum_table", &multem::IceParameters::set_spectrum_table, py::arg("q"), py::arg("P"),
          "Use a tabulated power spectrum P(q), q in 1/A (strictly increasing, > 0), instead of the two "
          "Gaussians: linear between knots, P(q0) below the first, 0 above the last. Needs the "
-         "band-limited potential.")
+         "band-limited potential. P's scale is irrelevant; v0 must then be the variance per molecule "
+         "over the table's own range (its integral of P 2 pi q dq), with no tail above the last knot.")
     .def("clear_spectrum_table", &multem::IceParameters::clear_spectrum_table)
     .def("has_spectrum_table", &multem::IceParameters::has_spectrum_table)
     .def_property_readonly("spectrum_q", [](const multem::IceParameters &p) { return p.spectrum_q; })

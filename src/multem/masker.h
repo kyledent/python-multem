@@ -1277,7 +1277,9 @@ namespace multem {
     // Optional tabulated power spectrum P(q), q in 1/A. Empty (the default) uses the two
     // Gaussians above. When set it replaces them: P is linear between knots, held at P(q0) below
     // the first knot and 0 above the last; its scale is irrelevant (v0 sets the variance). It
-    // needs the band-limited potential (MULTEM_BANDLIMITED_POTENTIAL=1).
+    // needs the band-limited potential (MULTEM_BANDLIMITED_POTENTIAL=1). With a table, v0 is the
+    // variance per molecule over the table's own range: the table's integral of P 2 pi q dq in the
+    // units of the target, with nothing added for power above the last knot, which counts as 0.
     std::vector<double> spectrum_q;
     std::vector<double> spectrum_P;
 
