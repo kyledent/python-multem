@@ -12,6 +12,7 @@
 #include <sstream>
 #include <iostream>
 #include <stdexcept>
+#include <algorithm>
 #include <array>
 #include <map>
 #include <string>
@@ -1145,6 +1146,108 @@ namespace multem {
     }
 
     /**
+     * A tabulated power spectrum (IceParameters::set_spectrum_table): linear between knots, held at
+     * P(q0) below the first knot, 0 above the last.
+     */
+    inline double spectrum_table_power(
+        double q, const std::vector<double> &qs, const std::vector<double> &Ps) {
+      if (q <= qs.front()) {
+        return Ps.front();
+      }
+      if (q >= qs.back()) {
+        return 0.0;
+      }
+      std::size_t j = std::upper_bound(qs.begin(), qs.end(), q) - qs.begin();
+      double t = (q - qs[j-1]) / (qs[j] - qs[j-1]);
+      return Ps[j-1] + t * (Ps[j] - Ps[j-1]);
+    }
+
+    /**
+     * int P W^2 q dq / int P q dq for a tabulated spectrum and the window of a grid of spacing dR.
+     * Integrated segment by segment (the table's own knots, plus the window's kinks at Nyquist/2
+     * and Nyquist), with a Gauss-Legendre rule on each piece, so no kink is smoothed over.
+     */
+    inline double band_limited_variance_fraction_table_uncached(
+        const std::vector<double> &qs, const std::vector<double> &Ps, double dR) {
+      double q_nyq = 0.5 / dR;
+      std::vector<double> edges;
+      edges.reserve(qs.size() + 3);
+      edges.push_back(0.0);
+      for (double q : qs) {
+        edges.push_back(q);
+      }
+      edges.push_back(mt::bandlimit::c_q1_frac * q_nyq);
+      edges.push_back(mt::bandlimit::c_q2_frac * q_nyq);
+      std::sort(edges.begin(), edges.end());
+      edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+      std::vector<double> xg, wg;
+      mt::bandlimit::gauss_legendre(8, -1.0, 1.0, xg, wg);
+      double num = 0, den = 0;
+      for (std::size_t i = 0; i + 1 < edges.size(); ++i) {
+        double a = edges[i], b = edges[i+1];
+        if (a >= qs.back()) {
+          break;
+        }
+        double xm = 0.5 * (a + b), xl = 0.5 * (b - a);
+        for (std::size_t k = 0; k < xg.size(); ++k) {
+          double q = xm + xl * xg[k];
+          double f = wg[k] * xl * q * spectrum_table_power(q, qs, Ps);
+          double W = mt::bandlimit::window(q, dR);
+          num += f * W * W;
+          den += f;
+        }
+      }
+      MULTEM_ASSERT(den > 0);
+      return num / den;
+    }
+
+    inline double band_limited_variance_fraction_table(
+        const std::vector<double> &qs, const std::vector<double> &Ps, double dR) {
+      // remembered per thread, keyed by the grid spacing and the table itself (compared on a hit)
+      struct Entry { double dR; std::vector<double> q, P; double value; };
+      thread_local std::vector<Entry> cache;
+      for (const auto &e : cache) {
+        if (e.dR == dR && e.q == qs && e.P == Ps) {
+          return e.value;
+        }
+      }
+      if (cache.size() > 64) {
+        cache.clear();
+      }
+      double value = band_limited_variance_fraction_table_uncached(qs, Ps, dR);
+      cache.push_back(Entry{dR, qs, Ps, value});
+      return value;
+    }
+
+    /**
+     * The random field's amplitude from a tabulated spectrum, sqrt(P(r)) times the band-limit
+     * window, on the same index layout as ComputeGaussianRandomFieldAmplitude. Built on the host
+     * and copied once per grid.
+     */
+    template <typename VectorType>
+    void compute_table_amplitude(
+        VectorType &amplitude,
+        std::size_t xsize, std::size_t ysize,
+        double x_pixel_size, double y_pixel_size, double dR_bl,
+        const std::vector<double> &qs, const std::vector<double> &Ps) {
+      using T = typename VectorType::value_type;
+      std::vector<T> host(xsize * ysize);
+      for (std::size_t i = 0; i < xsize; ++i) {
+        for (std::size_t j = 0; j < ysize; ++j) {
+          double xd = (i - xsize/2.0) / (x_pixel_size * xsize);
+          double yd = (j - ysize/2.0) / (y_pixel_size * ysize);
+          double r = std::sqrt(xd*xd + yd*yd);
+          double amp = std::sqrt(spectrum_table_power(r, qs, Ps));
+          if (dR_bl > 0) {
+            amp *= mt::bandlimit::window(r, dR_bl);
+          }
+          host[i * ysize + j] = amp;
+        }
+      }
+      thrust::copy(host.begin(), host.end(), amplitude.begin());
+    }
+
+    /**
      * Compute the FT of the Gaussian Random Field
      */
     template <typename Generator, typename T>
@@ -1237,6 +1340,10 @@ namespace multem {
       double s1_;
       double s2_;
       double density_;
+      double m0_;
+      double v0_;
+      std::vector<double> spectrum_q_;
+      std::vector<double> spectrum_P_;
       double x_pixel_size_;
       double y_pixel_size_;
       mt::Grid_2d<FloatType> grid_2d_;
@@ -1260,6 +1367,8 @@ namespace multem {
           a1_(0.199),
           a2_(0.801),
           density_(0.91),
+          m0_(-1),
+          v0_(-1),
           x_pixel_size_(1),
           y_pixel_size_(1),
           fft_data_counter_(0),
@@ -1298,6 +1407,10 @@ namespace multem {
         a1_ = masker.ice_parameters().a1;
         a2_ = masker.ice_parameters().a2;
         density_ = masker.ice_parameters().density;
+        m0_ = masker.ice_parameters().m0;
+        v0_ = masker.ice_parameters().v0;
+        spectrum_q_ = masker.ice_parameters().spectrum_q;
+        spectrum_P_ = masker.ice_parameters().spectrum_P;
       }
 
       /**
@@ -1359,7 +1472,11 @@ namespace multem {
         std::size_t size = xsize*ysize;
        
         // Compute amplitude the first iteration
-        if (fft_data_counter_ == 0) {
+        if (fft_data_counter_ == 0 && !spectrum_q_.empty()) {
+          MULTEM_ASSERT(band_limited_potential());  // a spectrum table needs the band-limited potential
+          compute_table_amplitude(amplitude_, xsize, ysize, x_pixel_size_, y_pixel_size_,
+              band_limit_spacing(x_pixel_size_, y_pixel_size_), spectrum_q_, spectrum_P_);
+        } else if (fft_data_counter_ == 0) {
           thrust::counting_iterator<size_t> indices(0);
           thrust::transform(
               indices,
@@ -1442,12 +1559,13 @@ namespace multem {
        * Compute the mean
        */
       double compute_mean(double density) const {
+        // m0 >= 0 overrides the mean potential constant, as on the multi-region path
         if (band_limited_potential()) {
           // band-limited atoms keep their whole integral at any pixel size
-          return water_projected_potential_integral() * density;
+          return ((m0_ >= 0) ? m0_ : water_projected_potential_integral()) * density;
         }
         //double M0 = 147.82; // Computed from MD water model
-        double M0 = 145.59; // Computed from MD water model
+        double M0 = (m0_ >= 0) ? m0_ : 145.59; // default computed from MD water model
         double Cv = compute_mean_correction(x_pixel_size_*y_pixel_size_);
         double mean = M0 * Cv * density;
         return mean;
@@ -1459,8 +1577,15 @@ namespace multem {
       double compute_sigma(double density) const {
         /* double V0 = 10784.46; // Computed by calibrating agaist MD water model */
         // double V0 = 10233.70; // Computed by calibrating agaist MD water model
-        double V0 = 10195.82; // Computed by calibrating agaist MD water model
-        double Cv = band_limited_potential()
+        double V0 = (v0_ >= 0) ? v0_ : 10195.82; // default computed by calibrating against MD water
+        if (!spectrum_q_.empty()) {
+          // the legacy pixel-area correction is calibrated for the default spectrum only
+          MULTEM_ASSERT(band_limited_potential());
+        }
+        double Cv = !spectrum_q_.empty()
+          ? band_limited_variance_fraction_table(spectrum_q_, spectrum_P_,
+              band_limit_spacing(x_pixel_size_, y_pixel_size_))
+          : band_limited_potential()
           ? band_limited_variance_fraction(a1_, a2_, m1_, m2_, s1_, s2_,
               band_limit_spacing(x_pixel_size_, y_pixel_size_))
           : compute_variance_correction(x_pixel_size_*y_pixel_size_);
@@ -1675,6 +1800,8 @@ namespace multem {
         mt::Vector<T_c, DeviceType> fft_data;
         std::size_t fft_data_counter;
         mt::Vector<T_r, DeviceType> random_field;
+        std::vector<double> spectrum_q;
+        std::vector<double> spectrum_P;
 
         RegionState()
           : a1(0.199), a2(0.801), m1(0), m2(1.0/2.88),
@@ -1687,6 +1814,8 @@ namespace multem {
           a1 = p.a1; a2 = p.a2;
           density = p.density;
           m0 = p.m0; v0 = p.v0;
+          spectrum_q = p.spectrum_q;
+          spectrum_P = p.spectrum_P;
         }
 
         void resize(std::size_t size) {
@@ -1773,7 +1902,13 @@ namespace multem {
       double compute_sigma(double n_particles, double v0_override, const RegionState &reg) const {
         double V0 = (v0_override >= 0) ? v0_override : 10195.82;
         double pixel_area = x_pixel_size_ * y_pixel_size_;
-        double Cv = band_limited_potential()
+        if (!reg.spectrum_q.empty()) {
+          MULTEM_ASSERT(band_limited_potential());  // a spectrum table needs the band-limited potential
+        }
+        double Cv = !reg.spectrum_q.empty()
+          ? band_limited_variance_fraction_table(reg.spectrum_q, reg.spectrum_P,
+              band_limit_spacing(x_pixel_size_, y_pixel_size_))
+          : band_limited_potential()
           ? band_limited_variance_fraction(reg.a1, reg.a2, reg.m1, reg.m2, reg.s1, reg.s2,
               band_limit_spacing(x_pixel_size_, y_pixel_size_))
           : compute_variance_correction(pixel_area);
@@ -1854,7 +1989,11 @@ namespace multem {
         std::size_t size = xsize * ysize;
 
         // Compute amplitude on first call (or after grid resize)
-        if (reg.fft_data_counter == 0) {
+        if (reg.fft_data_counter == 0 && !reg.spectrum_q.empty()) {
+          MULTEM_ASSERT(band_limited_potential());
+          compute_table_amplitude(reg.amplitude, xsize, ysize, x_pixel_size_, y_pixel_size_,
+              band_limit_spacing(x_pixel_size_, y_pixel_size_), reg.spectrum_q, reg.spectrum_P);
+        } else if (reg.fft_data_counter == 0) {
           thrust::counting_iterator<size_t> indices(0);
           thrust::transform(
               indices, indices + size,

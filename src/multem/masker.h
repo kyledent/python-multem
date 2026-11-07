@@ -14,7 +14,9 @@
 
 #include <array>
 #include <cassert>
+#include <cmath>
 #include <complex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <multem/error.h>
@@ -1272,6 +1274,13 @@ namespace multem {
     double m0;  // Mean potential constant override (-1 = use default 145.59)
     double v0;  // Variance constant override (-1 = use default 10195.82)
 
+    // Optional tabulated power spectrum P(q), q in 1/A. Empty (the default) uses the two
+    // Gaussians above. When set it replaces them: P is linear between knots, held at P(q0) below
+    // the first knot and 0 above the last; its scale is irrelevant (v0 sets the variance). It
+    // needs the band-limited potential (MULTEM_BANDLIMITED_POTENTIAL=1).
+    std::vector<double> spectrum_q;
+    std::vector<double> spectrum_P;
+
     IceParameters()
       : m1(0),
         m2(1.0/2.88),
@@ -1282,6 +1291,42 @@ namespace multem {
         density(0.91),
         m0(-1),
         v0(-1) {}
+
+    bool has_spectrum_table() const {
+      return !spectrum_q.empty();
+    }
+
+    void set_spectrum_table(const std::vector<double> &q, const std::vector<double> &P) {
+      if (q.size() != P.size()) {
+        throw std::invalid_argument("spectrum table: q and P differ in length");
+      }
+      if (q.size() < 2) {
+        throw std::invalid_argument("spectrum table: needs at least 2 knots");
+      }
+      bool positive = false;
+      for (std::size_t i = 0; i < q.size(); ++i) {
+        if (!std::isfinite(q[i]) || !std::isfinite(P[i])) {
+          throw std::invalid_argument("spectrum table: values must be finite");
+        }
+        if (P[i] < 0) {
+          throw std::invalid_argument("spectrum table: P must be >= 0");
+        }
+        if (i == 0 ? !(q[0] > 0) : !(q[i] > q[i-1])) {
+          throw std::invalid_argument("spectrum table: q must be > 0 and strictly increasing");
+        }
+        positive = positive || P[i] > 0;
+      }
+      if (!positive) {
+        throw std::invalid_argument("spectrum table: P is zero everywhere");
+      }
+      spectrum_q = q;
+      spectrum_P = P;
+    }
+
+    void clear_spectrum_table() {
+      spectrum_q.clear();
+      spectrum_P.clear();
+    }
   };
 
   /**

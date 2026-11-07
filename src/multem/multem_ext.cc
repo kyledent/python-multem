@@ -1374,6 +1374,14 @@ PYBIND11_MODULE(multem_ext, m)
     .def_readwrite("density", &multem::IceParameters::density)
     .def_readwrite("m0", &multem::IceParameters::m0)
     .def_readwrite("v0", &multem::IceParameters::v0)
+    .def("set_spectrum_table", &multem::IceParameters::set_spectrum_table, py::arg("q"), py::arg("P"),
+         "Use a tabulated power spectrum P(q), q in 1/A (strictly increasing, > 0), instead of the two "
+         "Gaussians: linear between knots, P(q0) below the first, 0 above the last. Needs the "
+         "band-limited potential.")
+    .def("clear_spectrum_table", &multem::IceParameters::clear_spectrum_table)
+    .def("has_spectrum_table", &multem::IceParameters::has_spectrum_table)
+    .def_property_readonly("spectrum_q", [](const multem::IceParameters &p) { return p.spectrum_q; })
+    .def_property_readonly("spectrum_P", [](const multem::IceParameters &p) { return p.spectrum_P; })
     ;
 
   // Wrap the multem::MaskerRegion struct
