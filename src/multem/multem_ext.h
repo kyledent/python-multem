@@ -839,6 +839,11 @@ namespace multem {
       const IceParameters &ice, double x_pixel_size, double y_pixel_size, double thickness);
 
   /**
+   * The mask the simulation computes for one slice of a masker, on the host or the device (for tests).
+   */
+  std::vector<int> compute_mask_engine(const Masker &masker, double zs, double ze, bool device);
+
+  /**
    * @returns True/False if the GPU is available
    */
   bool is_gpu_available();

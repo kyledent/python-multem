@@ -636,6 +636,7 @@ namespace multem {
     double zmax() const { return pmax_[2]; }
 
     const vector3& centre() const { return centre_; }
+    const vector3& centre_microscope() const { return centre_m_; }  // after rotation and translation
     double radius() const { return radius_; }
 
     const vector3& rotation_origin() const { return rotation_centre_; }

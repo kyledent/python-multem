@@ -1454,6 +1454,11 @@ PYBIND11_MODULE(multem_ext, m)
       &multem::compute_projected_potential_with_multi_material,
       py::call_guard<py::gil_scoped_release>());
   m.def(
+      "compute_mask_engine",
+      &multem::compute_mask_engine,
+      py::arg("masker"), py::arg("zs"), py::arg("ze"), py::arg("device") = false,
+      "The mask the simulation computes for one slice (the engine's own dispatch), for tests.");
+  m.def(
       "ice_slice_statistics",
       &multem::ice_slice_statistics,
       py::arg("ice"), py::arg("x_pixel_size"), py::arg("y_pixel_size"), py::arg("thickness"),

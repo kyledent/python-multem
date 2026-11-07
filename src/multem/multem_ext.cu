@@ -873,6 +873,60 @@ namespace multem {
     }
 
     /**
+     * The sphere's mask for one slice, on the device. The same test as SphereMasker::compute_mask, in
+     * the same order of operations, so the mask is identical; that loop writes one element at a time,
+     * which on a device vector is one transfer per pixel.
+     */
+    template <typename T>
+    struct SphereMaskSlice {
+      double cx, cy, dz2, r2, pixel_size;
+      std::size_t ysize;
+
+      SphereMaskSlice(double cx_, double cy_, double dz2_, double r2_, double pixel_size_, std::size_t ysize_)
+        : cx(cx_), cy(cy_), dz2(dz2_), r2(r2_), pixel_size(pixel_size_), ysize(ysize_) {}
+
+      DEVICE_CALLABLE
+      T operator()(size_t index) const {
+        size_t i = index / ysize;
+        size_t j = index - i * ysize;
+#ifdef __CUDA_ARCH__
+        // no fused multiply-adds: the host loop's rounding, so pixels on the surface agree
+        double dx = __dadd_rn(__dmul_rn(i + 0.5, pixel_size), -cx);
+        double dx2 = __dmul_rn(dx, dx);
+        double dy = __dadd_rn(__dmul_rn(j + 0.5, pixel_size), -cy);
+        return (__dadd_rn(__dadd_rn(dx2, __dmul_rn(dy, dy)), dz2) <= r2);
+#else
+        double dx = (i + 0.5) * pixel_size - cx;
+        double dx2 = dx * dx;
+        double dy = (j + 0.5) * pixel_size - cy;
+        return (dx2 + dy * dy + dz2 <= r2);
+#endif
+      }
+    };
+
+    /**
+     * Compute mask with sphere masker
+     */
+    template <typename Iterator>
+    void compute_mask(const SphereMasker &masker, double zs, double ze, Iterator iterator) {
+      MULTEM_ASSERT(ze > zs);
+      if (zs < masker.zmax() && ze > masker.zmin()) {
+        const auto &c = masker.centre_microscope();
+        double zc = (zs + ze) / 2.0;
+        double dz = zc - c[2];
+        double r = masker.radius();
+        thrust::counting_iterator<size_t> indices(0);
+        thrust::transform(
+            indices,
+            indices + masker.image_size(),
+            iterator,
+            SphereMaskSlice<bool>(c[0], c[1], dz * dz, r * r, masker.pixel_size(), masker.ysize()));
+      } else {
+        thrust::fill(iterator, iterator + masker.image_size(), 0);
+      }
+    }
+
+    /**
      * Compute mask
      */
     template <typename Iterator>
@@ -882,7 +936,7 @@ namespace multem {
       } else if (masker.shape() == Masker::Cylinder) {
         compute_mask(masker.cylinder_masker(), zs, ze, iterator);
       } else if (masker.shape() == Masker::Sphere) {
-        masker.sphere_masker().compute_mask(zs, ze, iterator);
+        compute_mask(masker.sphere_masker(), zs, ze, iterator);
       } else {
         MULTEM_ASSERT(false); // Unknown shape
       }
@@ -3223,6 +3277,27 @@ namespace multem {
       MULTEM_ASSERT(config.precision == "float" || config.precision == "double");
     }
     return result;
+  }
+
+  std::vector<int> compute_mask_engine(const Masker &masker, double zs, double ze, bool device) {
+    // the mask the simulation uses for one slice, on the host or in device memory (for tests)
+    std::vector<int> out(masker.image_size());
+    if (device) {
+#ifndef MULTEM_NO_CUDA
+      mt::Vector<bool, mt::e_device> m(masker.image_size());
+      detail::masker_compute_mask(masker, zs, ze, m.begin());
+      mt::Vector<bool, mt::e_host> h(m.size());
+      thrust::copy(m.begin(), m.end(), h.begin());
+      std::copy(h.begin(), h.end(), out.begin());
+#else
+      MULTEM_ASSERT(!device);
+#endif
+    } else {
+      mt::Vector<bool, mt::e_host> h(masker.image_size());
+      detail::masker_compute_mask(masker, zs, ze, h.begin());
+      std::copy(h.begin(), h.end(), out.begin());
+    }
+    return out;
   }
 
   std::tuple<double, double, bool> ice_slice_statistics(
