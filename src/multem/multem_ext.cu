@@ -1925,6 +1925,12 @@ namespace multem {
         for (std::size_t i = 0; i < regions_.size(); ++i) {
           auto &reg = regions_[i];
 
+          // A vacuum region (density <= 0) adds nothing. It exists so that other regions can
+          // subtract its shape, which compute_region_mask reads from the masker, not from here.
+          if (!(reg.density > 0)) {
+            continue;
+          }
+
           MULTEM_ASSERT(V_0.size() == reg.random_field.size());
           MULTEM_ASSERT(reg.mask.size() == reg.random_field.size());
 

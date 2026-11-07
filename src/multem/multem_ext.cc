@@ -1385,7 +1385,7 @@ PYBIND11_MODULE(multem_ext, m)
     ;
 
   // Wrap the multem::MultiRegionMasker class
-  py::class_<multem::MultiRegionMasker>(m, "MultiRegionMasker")
+  auto multi_region_masker = py::class_<multem::MultiRegionMasker>(m, "MultiRegionMasker")
     .def(py::init<>())
     .def(py::init<std::size_t, std::size_t, double>())
     .def("add_region", &multem::MultiRegionMasker::add_region,
@@ -1406,6 +1406,9 @@ PYBIND11_MODULE(multem_ext, m)
     .def("set_rotation", &multem::MultiRegionMasker::set_rotation)
     .def("set_translation", &multem::MultiRegionMasker::set_translation)
     ;
+  // A region with density <= 0 is vacuum: it adds no random field, and other regions can still
+  // subtract its shape. Engines without this reject such a region.
+  multi_region_masker.attr("supports_vacuum_regions") = py::bool_(true);
 
   // Expose the simulation function
   //
