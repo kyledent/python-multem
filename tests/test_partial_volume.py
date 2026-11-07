@@ -171,3 +171,44 @@ def test_vacuum_child_is_taken_off():
     inside = P[22:28, 22:28]
     assert float(np.abs(inside).max()) < 1e-9
     assert float(P[5:15, 40:60].mean()) > 1.0
+
+
+@pytest.mark.parametrize("device", devices())
+def test_embedded_sphere_is_not_eroded(device):
+    # A dense sphere inside an ice slab that subtracts it. With partial volume, the face slices hold both
+    # materials at the same pixel; the upstream add rule (ice at a third where the potential is
+    # positive) must see only the atoms, not the region added before, or the later region is eroded.
+    dz, n, LZ = 3.0, 32, 160.0
+    T0, T1 = 20.0, 140.0
+    c = (N * DR / 2, N * DR / 2, 80.3)
+    r = 40.0
+    water = multem.IceParameters()
+    water.density = 0.94
+    water.v0 = 1e-9
+    dense = multem.IceParameters()
+    dense.density = 1.35
+    dense.v0 = 1e-9
+    sph = multem.Masker(N, N, DR)
+    sph.set_sphere(list(c), r)
+    m = multem.MultiRegionMasker(N, N, DR)
+    m.add_region(slab_masker(T0, T1 - T0), water, [1])
+    m.add_region(sph, dense)
+    m.set_seed(1)
+    m.set_partial_volume(n)
+    sc = multem.SystemConfiguration()
+    sc.precision = "double"
+    sc.device = device
+    V = []
+    multem.compute_projected_potential(sc, _input(LZ, dz), m, lambda a, b, v: V.append(np.array(v)))
+    P = np.sum(V, axis=0)
+    mw = multem.ice_slice_statistics(water, DR, DR, 1.0)[0]
+    mp = multem.ice_slice_statistics(dense, DR, DR, 1.0)[0]
+    i, j = np.meshgrid(np.arange(N), np.arange(N), indexing="ij")
+    rho2 = (i * DR - c[0]) ** 2 + (j * DR - c[1]) ** 2
+    chord = 2 * np.sqrt(np.clip(r * r - rho2, 0, None))
+    expected = mw * ((T1 - T0) - chord) + mp * chord
+    core = rho2 < (0.5 * r) ** 2
+    err = (P - expected)[core] / (mp - mw)          # in A of dense path
+    print(f"\n{device}: embedded sphere, path error in the core: mean {err.mean():+.4f} A, max |{np.abs(err).max():.4f}| A")
+    # each of the sphere's two faces and the slab's two faces is good to dz/(2n); bound generously
+    assert np.abs(err).max() < 4 * dz / (2 * n) * (1 + mw / (mp - mw))

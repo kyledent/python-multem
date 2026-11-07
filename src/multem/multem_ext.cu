@@ -1980,6 +1980,7 @@ namespace multem {
       std::vector<RegionState> regions_;
       mt::Vector<bool, DeviceType> scratch_mask_;  // for boolean SUBTRACT
       mt::Vector<T_r, DeviceType> scratch_fraction_;  // for partial-volume SUBTRACT
+      mt::Vector<T_r, DeviceType> region_sum_;  // all regions' fields for this slice
 
       MultiMaterialPotentialApproximation()
         : gen_(std::random_device()()),
@@ -2007,6 +2008,7 @@ namespace multem {
           }
           scratch_mask_.resize(size);
           scratch_fraction_.resize(size);
+          region_sum_.resize(size);
         }
       }
 
@@ -2215,6 +2217,14 @@ namespace multem {
 
         double thickness = z_e - z_0;
 
+        // Sum every region's field first, then add the sum to the potential once. The upstream rule
+        // (ice at a third where the potential is positive) is meant for the atoms' potential; added
+        // region by region it also saw earlier regions' fields wherever two regions share a pixel,
+        // which partial-volume masks make the rule at faces. With 0/1 masks no two regions share a
+        // pixel, so the result is unchanged.
+        MULTEM_ASSERT(region_sum_.size() == V_0.size());
+        thrust::fill(region_sum_.begin(), region_sum_.end(), T_r(0));
+
         for (std::size_t i = 0; i < regions_.size(); ++i) {
           auto &reg = regions_[i];
 
@@ -2246,14 +2256,22 @@ namespace multem {
           // Shift the grid
           mt::fft2_shift(grid_2d_, reg.random_field);
 
-          // Add to potential
+          // Add to this slice's sum of region fields
           thrust::transform(
               reg.random_field.begin(),
               reg.random_field.end(),
-              V_0.begin(),
-              V_0.begin(),
-              AddRandomFieldAndPotential<FloatType>(1, 0.05));
+              region_sum_.begin(),
+              region_sum_.begin(),
+              thrust::plus<T_r>());
         }
+
+        // Add the regions to the potential
+        thrust::transform(
+            region_sum_.begin(),
+            region_sum_.end(),
+            V_0.begin(),
+            V_0.begin(),
+            AddRandomFieldAndPotential<FloatType>(1, 0.05));
       }
     };
 
