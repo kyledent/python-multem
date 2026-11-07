@@ -1359,6 +1359,10 @@ PYBIND11_MODULE(multem_ext, m)
     .def("set_seed", &multem::Masker::set_seed, py::arg("seed"),
          "Seed the ice's random field: >= 0 reproducible, negative (default -1) fresh each time")
     .def("seed", &multem::Masker::seed)
+    .def("set_partial_volume", &multem::Masker::set_partial_volume, py::arg("samples"),
+         "Weight each slice pixel by the fraction of the slice inside the region, from this many "
+         "sub-slice samples (0, the default, keeps the 0/1 midpoint test)")
+    .def("partial_volume", &multem::Masker::partial_volume)
     .def("compute", &pybind11::detail::Masker_compute)
     ;
 
@@ -1405,6 +1409,10 @@ PYBIND11_MODULE(multem_ext, m)
     .def("set_seed", &multem::MultiRegionMasker::set_seed, py::arg("seed"),
          "Seed the shared random field: >= 0 reproducible, negative (default -1) fresh each time")
     .def("seed", &multem::MultiRegionMasker::seed)
+    .def("set_partial_volume", &multem::MultiRegionMasker::set_partial_volume, py::arg("samples"),
+         "Weight each slice pixel by the fraction of the slice inside the region, from this many "
+         "sub-slice samples (0, the default, keeps the 0/1 midpoint test)")
+    .def("partial_volume", &multem::MultiRegionMasker::partial_volume)
     .def("region", &multem::MultiRegionMasker::region)
     .def("xsize", &multem::MultiRegionMasker::xsize)
     .def("ysize", &multem::MultiRegionMasker::ysize)
@@ -1458,6 +1466,11 @@ PYBIND11_MODULE(multem_ext, m)
       &multem::compute_mask_engine,
       py::arg("masker"), py::arg("zs"), py::arg("ze"), py::arg("device") = false,
       "The mask the simulation computes for one slice (the engine's own dispatch), for tests.");
+  m.def(
+      "compute_fraction_engine",
+      &multem::compute_fraction_engine,
+      py::arg("masker"), py::arg("zs"), py::arg("ze"), py::arg("samples"), py::arg("device") = false,
+      "The partial-volume fraction the simulation computes for one slice of a masker, for tests.");
   m.def(
       "ice_slice_statistics",
       &multem::ice_slice_statistics,

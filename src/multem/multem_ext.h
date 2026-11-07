@@ -844,6 +844,12 @@ namespace multem {
   std::vector<int> compute_mask_engine(const Masker &masker, double zs, double ze, bool device);
 
   /**
+   * The partial-volume fraction the simulation computes for one slice of a masker (for tests).
+   */
+  std::vector<double> compute_fraction_engine(
+      const Masker &masker, double zs, double ze, int samples, bool device);
+
+  /**
    * @returns True/False if the GPU is available
    */
   bool is_gpu_available();

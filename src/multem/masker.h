@@ -1627,6 +1627,20 @@ namespace multem {
       return seed_;
     }
 
+    /**
+     * Partial-volume slice masks: with n > 0 samples, each pixel of a slice is weighted by the fraction
+     * of the slice's depth inside the region (n sub-slice midpoint tests, error <= dz/(2n) per face),
+     * instead of the 0/1 test at the slice midpoint. 0 (the default) keeps the 0/1 test.
+     */
+    void set_partial_volume(int samples) {
+      MULTEM_ASSERT(samples >= 0 && samples <= 4096);
+      partial_volume_ = samples;
+    }
+
+    int partial_volume() const {
+      return partial_volume_;
+    }
+
   protected:
 
     Shape shape_;
@@ -1635,6 +1649,7 @@ namespace multem {
     SphereMasker sphere_masker_;
     IceParameters ice_parameters_;
     long long seed_ = -1;
+    int partial_volume_ = 0;
   };
 
 
@@ -1771,12 +1786,27 @@ namespace multem {
       return seed_;
     }
 
+    /**
+     * Partial-volume slice masks: with n > 0 samples, each pixel of a slice is weighted by the fraction
+     * of the slice's depth inside the region (n sub-slice midpoint tests, error <= dz/(2n) per face),
+     * instead of the 0/1 test at the slice midpoint. 0 (the default) keeps the 0/1 test.
+     */
+    void set_partial_volume(int samples) {
+      MULTEM_ASSERT(samples >= 0 && samples <= 4096);
+      partial_volume_ = samples;
+    }
+
+    int partial_volume() const {
+      return partial_volume_;
+    }
+
   private:
     std::size_t xsize_;
     std::size_t ysize_;
     double pixel_size_;
     std::vector<MaskerRegion> regions_;
     long long seed_ = -1;
+    int partial_volume_ = 0;
   };
 }
 

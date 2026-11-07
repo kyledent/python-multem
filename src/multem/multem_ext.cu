@@ -953,6 +953,65 @@ namespace multem {
     };
 
     /**
+     * Partial-volume masks: f accumulates the sub-slice point tests, then is scaled by 1/n.
+     */
+    template <typename T>
+    struct AddPointTest {
+      DEVICE_CALLABLE
+      T operator()(T f, bool b) const { return f + (b ? T(1) : T(0)); }
+    };
+
+    template <typename T>
+    struct ScaleBy {
+      T s;
+      ScaleBy(T s_) : s(s_) {}
+      DEVICE_CALLABLE
+      T operator()(T f) const { return f * s; }
+    };
+
+    template <typename T>
+    struct SubtractClip {
+      DEVICE_CALLABLE
+      T operator()(T a, T b) const { T d = a - b; return d > T(0) ? d : T(0); }
+    };
+
+    /**
+     * The fraction of [zs, ze) inside the masker's shape, per pixel, from n sub-slice midpoint tests;
+     * scratch holds one 0/1 test at a time.
+     */
+    template <typename FracVector, typename BoolVector>
+    void masker_compute_fraction(
+        const Masker &masker, double zs, double ze, int n, FracVector &frac, BoolVector &scratch) {
+      using T = typename FracVector::value_type;
+      MULTEM_ASSERT(n > 0 && ze > zs);
+      thrust::fill(frac.begin(), frac.end(), T(0));
+      double h = (ze - zs) / n;
+      for (int k = 0; k < n; ++k) {
+        masker_compute_mask(masker, zs + k * h, zs + (k + 1) * h, scratch.begin());
+        thrust::transform(frac.begin(), frac.end(), scratch.begin(), frac.begin(), AddPointTest<T>());
+      }
+      thrust::transform(frac.begin(), frac.end(), frac.begin(), ScaleBy<T>(T(1.0 / n)));
+    }
+
+    /**
+     * A region's partial-volume fraction with its subtracted regions taken off along the ray
+     * (nested children: f = max(f_self - sum f_child, 0)).
+     */
+    template <typename FracVector, typename BoolVector>
+    void compute_region_fraction(
+        const MultiRegionMasker &masker, std::size_t region_index, double zs, double ze, int n,
+        FracVector &frac, FracVector &scratch_frac, BoolVector &scratch_bool) {
+      using T = typename FracVector::value_type;
+      const auto &region = masker.region(region_index);
+      masker_compute_fraction(region.shape, zs, ze, n, frac, scratch_bool);
+      for (int sub_idx : region.subtract_regions) {
+        MULTEM_ASSERT(sub_idx >= 0 && sub_idx < (int)masker.num_regions());
+        masker_compute_fraction(masker.region(sub_idx).shape, zs, ze, n, scratch_frac, scratch_bool);
+        thrust::transform(frac.begin(), frac.end(), scratch_frac.begin(), frac.begin(), SubtractClip<T>());
+      }
+    }
+
+    /**
      * Compute the mask for a single region of a MultiRegionMasker,
      * applying boolean SUBTRACT operations.
      */
@@ -1356,6 +1415,20 @@ namespace multem {
     };
 
     /**
+     * Partial-volume version: the mean scales with the fraction f of the slice inside the region, and
+     * the texture's variance with f too (its molecule count), so its amplitude with sqrt(f).
+     */
+    struct FractionAndNormalize {
+      const double a, x_mean, mu;
+      FractionAndNormalize(double a_, double x_mean_, double mu_) : a(a_), x_mean(x_mean_), mu(mu_) {}
+      template <typename T, typename U>
+      DEVICE_CALLABLE
+      U operator()(const T f, const U x) const {
+        return U(f * mu + sqrt((double)f) * a * (x - x_mean));
+      }
+    };
+
+    /**
      * Add the potential and random field if potential == 0
      */
     template <typename T>
@@ -1406,6 +1479,7 @@ namespace multem {
       std::size_t fft_data_counter_;
       mt::Vector<T_r, DeviceType> random_field_;
       mt::Vector<bool, DeviceType> mask_;
+      mt::Vector<T_r, DeviceType> fraction_;
       mt::FFT<T_r, DeviceType> *fft_2d_;
       Masker masker_;
       
@@ -1479,6 +1553,7 @@ namespace multem {
           fft_data_.resize(grid_2d.nx * grid_2d.ny);
           random_field_.resize(grid_2d.nx * grid_2d.ny);
           mask_.resize(grid_2d.nx * grid_2d.ny);
+          fraction_.resize(grid_2d.nx * grid_2d.ny);
           fft_data_counter_ = 0;
         }
       }
@@ -1512,7 +1587,11 @@ namespace multem {
         MULTEM_ASSERT(masker_.xsize() * masker_.ysize() == mask_.size());
 
         // Create host vector and then compute mask and copy
-        masker_compute_mask(masker_, z_0, z_e, mask_.begin());
+        if (masker_.partial_volume() > 0) {
+          masker_compute_fraction(masker_, z_0, z_e, masker_.partial_volume(), fraction_, mask_);
+        } else {
+          masker_compute_mask(masker_, z_0, z_e, mask_.begin());
+        }
       }
 
       /**
@@ -1598,12 +1677,21 @@ namespace multem {
         // Normalize by the variance
         MULTEM_ASSERT(sigma > 0);
         MULTEM_ASSERT(sdev > 0);
-        thrust::transform(
-            mask_.begin(),
-            mask_.end(),
-            random_field_.begin(),
-            random_field_.begin(),
-            MaskAndNormalize(sigma/sdev, mu - mean*sigma/sdev));
+        if (masker_.partial_volume() > 0) {
+          thrust::transform(
+              fraction_.begin(),
+              fraction_.end(),
+              random_field_.begin(),
+              random_field_.begin(),
+              FractionAndNormalize(sigma/sdev, mean, mu));
+        } else {
+          thrust::transform(
+              mask_.begin(),
+              mask_.end(),
+              random_field_.begin(),
+              random_field_.begin(),
+              MaskAndNormalize(sigma/sdev, mu - mean*sigma/sdev));
+        }
         
         // Toggle real/imag
         fft_data_counter_++;
@@ -1850,6 +1938,7 @@ namespace multem {
       struct RegionState {
         double a1, a2, m1, m2, s1, s2, density, m0, v0;
         mt::Vector<bool, DeviceType> mask;
+        mt::Vector<T_r, DeviceType> fraction;
         mt::Vector<T_r, DeviceType> amplitude;
         mt::Vector<T_c, DeviceType> fft_data;
         std::size_t fft_data_counter;
@@ -1874,6 +1963,7 @@ namespace multem {
 
         void resize(std::size_t size) {
           mask.resize(size);
+          fraction.resize(size);
           amplitude.resize(size);
           fft_data.resize(size);
           random_field.resize(size);
@@ -1889,6 +1979,7 @@ namespace multem {
       MultiRegionMasker masker_;
       std::vector<RegionState> regions_;
       mt::Vector<bool, DeviceType> scratch_mask_;  // for boolean SUBTRACT
+      mt::Vector<T_r, DeviceType> scratch_fraction_;  // for partial-volume SUBTRACT
 
       MultiMaterialPotentialApproximation()
         : gen_(std::random_device()()),
@@ -1915,6 +2006,7 @@ namespace multem {
             r.resize(size);
           }
           scratch_mask_.resize(size);
+          scratch_fraction_.resize(size);
         }
       }
 
@@ -2092,11 +2184,19 @@ namespace multem {
         MULTEM_ASSERT(sdev > 0);
 
         // Mask and normalize
-        thrust::transform(
-            reg.mask.begin(), reg.mask.end(),
-            reg.random_field.begin(),
-            reg.random_field.begin(),
-            MaskAndNormalize(sigma/sdev, mean - rf_mean*sigma/sdev));
+        if (masker_.partial_volume() > 0) {
+          thrust::transform(
+              reg.fraction.begin(), reg.fraction.end(),
+              reg.random_field.begin(),
+              reg.random_field.begin(),
+              FractionAndNormalize(sigma/sdev, rf_mean, mean));
+        } else {
+          thrust::transform(
+              reg.mask.begin(), reg.mask.end(),
+              reg.random_field.begin(),
+              reg.random_field.begin(),
+              MaskAndNormalize(sigma/sdev, mean - rf_mean*sigma/sdev));
+        }
 
         reg.fft_data_counter++;
       }
@@ -2127,8 +2227,13 @@ namespace multem {
           MULTEM_ASSERT(V_0.size() == reg.random_field.size());
           MULTEM_ASSERT(reg.mask.size() == reg.random_field.size());
 
-          // Compute mask with boolean subtraction
-          compute_region_mask(masker_, i, z_0, z_e, reg.mask, scratch_mask_);
+          // Compute mask with boolean subtraction (or the partial-volume fraction)
+          if (masker_.partial_volume() > 0) {
+            compute_region_fraction(masker_, i, z_0, z_e, masker_.partial_volume(),
+                                    reg.fraction, scratch_fraction_, scratch_mask_);
+          } else {
+            compute_region_mask(masker_, i, z_0, z_e, reg.mask, scratch_mask_);
+          }
 
           // Compute GRF statistics for this material
           double number_density = compute_number_density_of_water(reg.density);
@@ -3277,6 +3382,29 @@ namespace multem {
       MULTEM_ASSERT(config.precision == "float" || config.precision == "double");
     }
     return result;
+  }
+
+  std::vector<double> compute_fraction_engine(
+      const Masker &masker, double zs, double ze, int samples, bool device) {
+    std::vector<double> out(masker.image_size());
+    if (device) {
+#ifndef MULTEM_NO_CUDA
+      mt::Vector<double, mt::e_device> f(masker.image_size());
+      mt::Vector<bool, mt::e_device> b(masker.image_size());
+      detail::masker_compute_fraction(masker, zs, ze, samples, f, b);
+      mt::Vector<double, mt::e_host> h(f.size());
+      thrust::copy(f.begin(), f.end(), h.begin());
+      std::copy(h.begin(), h.end(), out.begin());
+#else
+      MULTEM_ASSERT(!device);
+#endif
+    } else {
+      mt::Vector<double, mt::e_host> f(masker.image_size());
+      mt::Vector<bool, mt::e_host> b(masker.image_size());
+      detail::masker_compute_fraction(masker, zs, ze, samples, f, b);
+      std::copy(f.begin(), f.end(), out.begin());
+    }
+    return out;
   }
 
   std::vector<int> compute_mask_engine(const Masker &masker, double zs, double ze, bool device) {
