@@ -91,7 +91,10 @@ material (`IceParameters`) and regions it subtracts.
   slice per pair of faces. `set_partial_volume(n)` weights each pixel by the fraction of the slice inside
   the region instead. For spheres and cuboids (at any rotation) the fraction is exact, from where the ray
   meets the shape, and costs one evaluation per slice; cylinders take n sub-slice samples (error at most
-  dz/(2n) per face). The mean scales with the fraction and the texture's variance with it too.
+  dz/(2n) per face). The mean scales with the fraction and the texture's variance with it too. A region's
+  subtracted regions are taken off as fractions (f − f_sub, clipped at 0). That is exact where the subtracted
+  region lies inside the region along the ray, the nested case. For siblings that only partly overlap in a
+  slice it is not.
 - **Spectrum.** `IceParameters.set_spectrum_table(q, P)` replaces the two-Gaussian power spectrum with a
   table (it needs the band-limited potential). `v0` is then the variance per molecule over the table's own
   range.
