@@ -100,7 +100,10 @@ material (`IceParameters`) and regions it subtracts.
   orientation) intersected with up to 16 half-spaces n·p ≤ d. It can subtract an inner set given the same way.
   Ellipsoids with cuts, boxes at any rotation, slabs with a rectangle or disc footprint, and ellipsoidal shells all
   take this form. A ray along z meets such a set in one interval, so partial-volume fractions are exact here too.
-  The masker's rotation and translation apply as for the other shapes.
+  The masker's rotation and translation apply as for the other shapes. Faces are closed for planes (n·p ≤ d) and half-open
+  in z for the interval; the cuboid shape is half-open on every face. So a box built from planes and the cuboid
+  disagree only for a pixel column lying exactly in a vertical face, a set of measure zero that a synthetic
+  scene on a lattice can still hit.
 - **Vacuum.** A region with density 0 adds nothing, and other regions can still subtract its shape.
 - **Test hooks.** `compute_mask_engine`, `compute_fraction_engine` and `compute_region_labels_engine` return what
   the simulation computes for one slice. The last gives each pixel's owning region after subtractions: its index,
