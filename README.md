@@ -65,7 +65,9 @@ With `MULTEM_BANDLIMITED_POTENTIAL=1` MULTEM tabulates instead each atom's proje
 low-pass filtered to the grid -- flat to half the Nyquist frequency, a raised cosine to zero at
 Nyquist. A function with nothing at or beyond twice Nyquist sums on the grid to its integral, so
 every atom deposits its whole projected potential at any pixel size and any sub-pixel position, and
-nothing above Nyquist aliases. The ice model follows suit: its mean is the projected-potential
+nothing above Nyquist aliases. As tabulated, the sum matches the integral to about 1e-4: one atom's grid
+sum varies by about 1e-4 with its sub-pixel position, independent of slice thickness and box size. The
+ice model's mean is computed analytically, not summed from the grid. The ice model follows suit: its mean is the projected-potential
 integral of a water molecule times the number of molecules, with no pixel-size correction, its
 variance is the part of its power spectrum that the band passes, and its spectrum carries the same
 window.
