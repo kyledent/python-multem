@@ -1268,7 +1268,7 @@ namespace multem {
    * n.p <= d. Microscope frame. A ray along z through (x, y) meets it in one interval [z0, z1].
    */
   struct ConvexSet {
-    static const int MAX_PLANES = 16;
+    static const int MAX_PLANES = 32;
     bool quadric = false;
     double A[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
     double c[3] = {0, 0, 0};

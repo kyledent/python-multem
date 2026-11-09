@@ -243,3 +243,15 @@ def test_convex_region_in_the_projected_potential(device):
         return np.sum(V, axis=0)
     a, b = run(False), run(True)
     assert np.max(np.abs(a - b)) < 1e-9 * np.max(np.abs(a))
+
+
+def test_plane_limit_is_exposed_and_enforced():
+    n = multem.convex_max_planes()
+    assert n == 32
+    m = multem.Masker(N, N, DR)
+    # n planes all containing the field: accepted
+    planes = [(np.cos(a), np.sin(a), 0.0, 1e4) for a in np.linspace(0, 2 * np.pi, n, endpoint=False)]
+    m.set_convex(ellipsoid_A([10.0, 10.0, 10.0]), [L / 2, L / 2, 20.0], planes)
+    assert mask(m, 18.5, 21.5).sum() > 0
+    with pytest.raises(Exception):
+        m.set_convex(ellipsoid_A([10.0, 10.0, 10.0]), [L / 2, L / 2, 20.0], planes + [(1.0, 0.0, 0.0, 1e4)])

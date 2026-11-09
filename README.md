@@ -100,7 +100,7 @@ material (`IceParameters`) and regions it subtracts.
   range.
 - **Convex regions.** `Masker.set_convex(A, centre, planes, has_inner, inner_A, inner_centre, inner_planes)`
   takes an optional quadric (p − c)ᵀA(p − c) ≤ 1 (an ellipsoid, or an elliptic cylinder when A is singular, at any
-  orientation) intersected with up to 16 half-spaces n·p ≤ d. It can subtract an inner set given the same way.
+  orientation) intersected with up to `multem.convex_max_planes()` (32) half-spaces n·p ≤ d. It can subtract an inner set given the same way.
   Ellipsoids with cuts, boxes at any rotation, slabs with a rectangle or disc footprint, and ellipsoidal shells all
   take this form. A ray along z meets such a set in one interval, so partial-volume fractions are exact here too.
   The masker's rotation and translation apply as for the other shapes. Faces are closed for planes (n·p ≤ d) and half-open

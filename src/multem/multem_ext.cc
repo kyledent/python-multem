@@ -1476,6 +1476,8 @@ PYBIND11_MODULE(multem_ext, m)
       &multem::compute_mask_engine,
       py::arg("masker"), py::arg("zs"), py::arg("ze"), py::arg("device") = false,
       "The mask the simulation computes for one slice (the engine's own dispatch), for tests.");
+  m.def("convex_max_planes", []() { return multem::ConvexSet::MAX_PLANES; },
+        "The most half-spaces one convex set (Masker.set_convex, outer or inner) may have.");
   m.def(
       "compute_region_labels_engine",
       &multem::compute_region_labels_engine,
