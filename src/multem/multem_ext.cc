@@ -1360,8 +1360,8 @@ PYBIND11_MODULE(multem_ext, m)
          "Seed the ice's random field: >= 0 reproducible, negative (default -1) fresh each time")
     .def("seed", &multem::Masker::seed)
     .def("set_partial_volume", &multem::Masker::set_partial_volume, py::arg("samples"),
-         "Weight each slice pixel by the fraction of the slice inside the region, from this many "
-         "sub-slice samples (0, the default, keeps the 0/1 midpoint test)")
+         "Weight each slice pixel by the fraction of the slice inside the region (0, the default, keeps "
+         "the 0/1 midpoint test). Spheres and cuboids are exact for any n > 0; cylinders use n sub-slice samples")
     .def("partial_volume", &multem::Masker::partial_volume)
     .def("compute", &pybind11::detail::Masker_compute)
     ;
@@ -1410,8 +1410,8 @@ PYBIND11_MODULE(multem_ext, m)
          "Seed the shared random field: >= 0 reproducible, negative (default -1) fresh each time")
     .def("seed", &multem::MultiRegionMasker::seed)
     .def("set_partial_volume", &multem::MultiRegionMasker::set_partial_volume, py::arg("samples"),
-         "Weight each slice pixel by the fraction of the slice inside the region, from this many "
-         "sub-slice samples (0, the default, keeps the 0/1 midpoint test)")
+         "Weight each slice pixel by the fraction of the slice inside the region (0, the default, keeps "
+         "the 0/1 midpoint test). Spheres and cuboids are exact for any n > 0; cylinders use n sub-slice samples")
     .def("partial_volume", &multem::MultiRegionMasker::partial_volume)
     .def("region", &multem::MultiRegionMasker::region)
     .def("xsize", &multem::MultiRegionMasker::xsize)

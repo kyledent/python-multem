@@ -89,8 +89,9 @@ material (`IceParameters`) and regions it subtracts.
 - **Partial volume.** By default a slice takes a region wholly or not at all, by where the slice's
   midpoint falls, so at normal incidence a region's path is a whole number of slices: off by up to a
   slice per pair of faces. `set_partial_volume(n)` weights each pixel by the fraction of the slice inside
-  the region instead (n sub-slice samples; error at most dz/(2n) per face). The mean scales with the
-  fraction and the texture's variance with it too.
+  the region instead. For spheres and cuboids (at any rotation) the fraction is exact, from where the ray
+  meets the shape, and costs one evaluation per slice; cylinders take n sub-slice samples (error at most
+  dz/(2n) per face). The mean scales with the fraction and the texture's variance with it too.
 - **Spectrum.** `IceParameters.set_spectrum_table(q, P)` replaces the two-Gaussian power spectrum with a
   table (it needs the band-limited potential). `v0` is then the variance per molecule over the table's own
   range.

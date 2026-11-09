@@ -1628,9 +1628,10 @@ namespace multem {
     }
 
     /**
-     * Partial-volume slice masks: with n > 0 samples, each pixel of a slice is weighted by the fraction
-     * of the slice's depth inside the region (n sub-slice midpoint tests, error <= dz/(2n) per face),
-     * instead of the 0/1 test at the slice midpoint. 0 (the default) keeps the 0/1 test.
+     * Partial-volume slice masks: with n > 0, each pixel of a slice is weighted by the fraction of the
+     * slice's depth inside the region, instead of the 0/1 test at the slice midpoint. Spheres and cuboids
+     * (at any rotation) are exact and do not use n; cylinders take n sub-slice midpoint tests (error
+     * <= dz/(2n) per face). 0 (the default) keeps the 0/1 test.
      */
     void set_partial_volume(int samples) {
       MULTEM_ASSERT(samples >= 0 && samples <= 4096);
@@ -1787,9 +1788,10 @@ namespace multem {
     }
 
     /**
-     * Partial-volume slice masks: with n > 0 samples, each pixel of a slice is weighted by the fraction
-     * of the slice's depth inside the region (n sub-slice midpoint tests, error <= dz/(2n) per face),
-     * instead of the 0/1 test at the slice midpoint. 0 (the default) keeps the 0/1 test.
+     * Partial-volume slice masks: with n > 0, each pixel of a slice is weighted by the fraction of the
+     * slice's depth inside the region, instead of the 0/1 test at the slice midpoint. Spheres and cuboids
+     * (at any rotation) are exact and do not use n; cylinders take n sub-slice midpoint tests (error
+     * <= dz/(2n) per face). 0 (the default) keeps the 0/1 test.
      */
     void set_partial_volume(int samples) {
       MULTEM_ASSERT(samples >= 0 && samples <= 4096);

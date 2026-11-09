@@ -976,14 +976,140 @@ namespace multem {
     };
 
     /**
-     * The fraction of [zs, ze) inside the masker's shape, per pixel, from n sub-slice midpoint tests;
-     * scratch holds one 0/1 test at a time.
+     * Rounded double arithmetic, so host and device fractions are bit-identical: no fused multiply-adds
+     * on the device. Division and sqrt are correctly rounded on both.
+     */
+    DEVICE_CALLABLE inline double rn_mul(double a, double b) {
+#ifdef __CUDA_ARCH__
+      return __dmul_rn(a, b);
+#else
+      return a * b;
+#endif
+    }
+
+    DEVICE_CALLABLE inline double rn_add(double a, double b) {
+#ifdef __CUDA_ARCH__
+      return __dadd_rn(a, b);
+#else
+      return a + b;
+#endif
+    }
+
+    /**
+     * Exact partial-volume fraction for a sphere: the ray along z through pixel (i dx, j dx) meets the
+     * sphere in [cz - h, cz + h], h = sqrt(r^2 - rho^2); the fraction is that interval's overlap with
+     * [zs, ze) over the slice's depth.
+     */
+    template <typename T>
+    struct SphereFractionSlice {
+      double cx, cy, cz, r2, zs, ze, pixel_size;
+      std::size_t ysize;
+
+      SphereFractionSlice(double cx_, double cy_, double cz_, double r2_, double zs_, double ze_,
+                          double pixel_size_, std::size_t ysize_)
+        : cx(cx_), cy(cy_), cz(cz_), r2(r2_), zs(zs_), ze(ze_), pixel_size(pixel_size_), ysize(ysize_) {}
+
+      DEVICE_CALLABLE
+      T operator()(size_t index) const {
+        size_t i = index / ysize;
+        size_t j = index - i * ysize;
+        double dx = rn_add(rn_mul((double)i, pixel_size), -cx);
+        double dy = rn_add(rn_mul((double)j, pixel_size), -cy);
+        double h2 = rn_add(r2, -rn_add(rn_mul(dx, dx), rn_mul(dy, dy)));
+        if (!(h2 > 0)) return T(0);
+        double h = sqrt(h2);
+        double lo = rn_add(cz, -h);
+        double hi = rn_add(cz, h);
+        lo = lo > zs ? lo : zs;
+        hi = hi < ze ? hi : ze;
+        return hi > lo ? T(rn_add(hi, -lo) / rn_add(ze, -zs)) : T(0);
+      }
+    };
+
+    /**
+     * Exact partial-volume fraction for a cuboid at any rotation: the same three slab tests as
+     * CuboidMaskSlice (lo <= e.p < hi for each edge e), solved for z along the ray through the pixel,
+     * give an interval [z0, z1]; the fraction is its overlap with [zs, ze) over the slice's depth.
+     */
+    template <typename T>
+    struct CuboidFractionSlice {
+      double e[3][3];
+      double lo_[3], hi_[3];
+      double zs, ze, pixel_size;
+      std::size_t ysize;
+
+      CuboidFractionSlice(const double *p1, const double *p2, const double *p3, const double *p4,
+                          double zs_, double ze_, double pixel_size_, std::size_t ysize_)
+        : zs(zs_), ze(ze_), pixel_size(pixel_size_), ysize(ysize_) {
+        const double *q[3] = {p2, p3, p4};
+        for (int k = 0; k < 3; ++k) {
+          for (int c = 0; c < 3; ++c) e[k][c] = q[k][c] - p1[c];
+          double a = e[k][0] * p1[0] + e[k][1] * p1[1] + e[k][2] * p1[2];
+          double b = e[k][0] * q[k][0] + e[k][1] * q[k][1] + e[k][2] * q[k][2];
+          lo_[k] = a < b ? a : b;
+          hi_[k] = a < b ? b : a;
+        }
+      }
+
+      DEVICE_CALLABLE
+      T operator()(size_t index) const {
+        size_t i = index / ysize;
+        size_t j = index - i * ysize;
+        double x = rn_mul((double)i, pixel_size);
+        double y = rn_mul((double)j, pixel_size);
+        double z0 = zs, z1 = ze;
+        for (int k = 0; k < 3; ++k) {
+          double s = rn_add(rn_mul(e[k][0], x), rn_mul(e[k][1], y));
+          double g = e[k][2];
+          if (g == 0) {
+            if (!(s >= lo_[k] && s < hi_[k])) return T(0);
+          } else {
+            double a = rn_add(lo_[k], -s) / g;
+            double b = rn_add(hi_[k], -s) / g;
+            if (a > b) { double t = a; a = b; b = t; }
+            z0 = a > z0 ? a : z0;
+            z1 = b < z1 ? b : z1;
+          }
+        }
+        return z1 > z0 ? T(rn_add(z1, -z0) / rn_add(ze, -zs)) : T(0);
+      }
+    };
+
+    /**
+     * The fraction of [zs, ze) inside the masker's shape, per pixel. Spheres and cuboids are exact (one
+     * evaluation, n not used); other shapes take n sub-slice midpoint tests, with scratch holding one 0/1
+     * test at a time.
      */
     template <typename FracVector, typename BoolVector>
     void masker_compute_fraction(
         const Masker &masker, double zs, double ze, int n, FracVector &frac, BoolVector &scratch) {
       using T = typename FracVector::value_type;
       MULTEM_ASSERT(n > 0 && ze > zs);
+      if (masker.shape() == Masker::Sphere || masker.shape() == Masker::Cuboid) {
+        bool in_range = (masker.shape() == Masker::Sphere)
+          ? (zs < masker.sphere_masker().zmax() && ze > masker.sphere_masker().zmin())
+          : (zs < masker.cuboid_masker().zmax() && ze > masker.cuboid_masker().zmin());
+        if (!in_range) {
+          thrust::fill(frac.begin(), frac.end(), T(0));
+          return;
+        }
+        thrust::counting_iterator<size_t> indices(0);
+        if (masker.shape() == Masker::Sphere) {
+          const auto &s = masker.sphere_masker();
+          const auto &c = s.centre_microscope();
+          thrust::transform(indices, indices + s.image_size(), frac.begin(),
+              SphereFractionSlice<T>(c[0], c[1], c[2], s.radius() * s.radius(), zs, ze, s.pixel_size(), s.ysize()));
+        } else {
+          const auto &m = masker.cuboid_masker();
+          auto p1 = m.points()[0];
+          auto p2 = m.points()[1];
+          auto p3 = m.points()[2];
+          auto p4 = m.points()[3];
+          thrust::transform(indices, indices + m.image_size(), frac.begin(),
+              CuboidFractionSlice<T>(&p1[0], &p2[0], &p3[0], &p4[0], zs, ze, m.pixel_size(), m.ysize()));
+        }
+        return;
+      }
       thrust::fill(frac.begin(), frac.end(), T(0));
       double h = (ze - zs) / n;
       for (int k = 0; k < n; ++k) {
