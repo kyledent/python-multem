@@ -1327,6 +1327,7 @@ PYBIND11_MODULE(multem_ext, m)
     .value("Cuboid", multem::Masker::Shape::Cuboid)
     .value("Cylinder", multem::Masker::Shape::Cylinder)
     .value("Sphere", multem::Masker::Shape::Sphere)
+    .value("Convex", multem::Masker::Shape::Convex)
     .export_values();
 
   // Wrap the multem::Masker class
@@ -1353,6 +1354,15 @@ PYBIND11_MODULE(multem_ext, m)
     .def("set_cuboid", &multem::Masker::set_cuboid)
     .def("set_cylinder", &multem::Masker::set_cylinder)
     .def("set_sphere", &multem::Masker::set_sphere)
+    .def("set_convex", &multem::Masker::set_convex,
+         py::arg("A"), py::arg("centre"), py::arg("planes"),
+         py::arg("has_inner") = false, py::arg("inner_A") = std::vector<double>(),
+         py::arg("inner_centre") = std::array<double, 3>{0, 0, 0},
+         py::arg("inner_planes") = std::vector<std::array<double, 4>>(),
+         "A convex region in sample coordinates: the quadric (p - c)^T A (p - c) <= 1 (A: 9 numbers, row-major, "
+         "symmetric positive semi-definite; [] for none) intersected with half-spaces n.p <= d, given as "
+         "(nx, ny, nz, d); optionally minus an inner set given the same way (has_inner). Ellipsoids with axes "
+         "and cuts, boxes at any rotation, slabs and ellipsoidal shells all take this form.")
     .def("set_rotation", &multem::Masker::set_rotation)
     .def("set_translation", &multem::Masker::set_translation)
     .def("set_ice_parameters", &multem::Masker::set_ice_parameters)
@@ -1466,6 +1476,11 @@ PYBIND11_MODULE(multem_ext, m)
       &multem::compute_mask_engine,
       py::arg("masker"), py::arg("zs"), py::arg("ze"), py::arg("device") = false,
       "The mask the simulation computes for one slice (the engine's own dispatch), for tests.");
+  m.def(
+      "compute_region_labels_engine",
+      &multem::compute_region_labels_engine,
+      py::arg("masker"), py::arg("zs"), py::arg("ze"), py::arg("device") = false,
+      "Per pixel, the region owning one slice after subtractions: its index, -1 none, -2 several; for tests.");
   m.def(
       "compute_fraction_engine",
       &multem::compute_fraction_engine,

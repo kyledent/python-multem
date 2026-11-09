@@ -12,6 +12,7 @@
 #ifndef MULTEM_MASKER_H
 #define MULTEM_MASKER_H
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cmath>
@@ -1255,6 +1256,299 @@ namespace multem {
   };
 
 
+#ifdef __CUDACC__
+#define MASKER_HD __host__ __device__
+#else
+#define MASKER_HD
+#endif
+
+  /**
+   * A convex set: an optional quadric (p - c)^T A (p - c) <= 1 (A symmetric positive semi-definite: an
+   * ellipsoid, or an elliptic cylinder when A is singular), intersected with up to MAX_PLANES half-spaces
+   * n.p <= d. Microscope frame. A ray along z through (x, y) meets it in one interval [z0, z1].
+   */
+  struct ConvexSet {
+    static const int MAX_PLANES = 16;
+    bool quadric = false;
+    double A[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    double c[3] = {0, 0, 0};
+    int nplanes = 0;
+    double planes[MAX_PLANES][4] = {};  // nx, ny, nz, d
+
+    /**
+     * Rounded arithmetic without fused multiply-adds, so host and device give the same bits.
+     */
+    MASKER_HD static double mul(double a, double b) {
+#ifdef __CUDA_ARCH__
+      return __dmul_rn(a, b);
+#else
+      return a * b;
+#endif
+    }
+
+    MASKER_HD static double add(double a, double b) {
+#ifdef __CUDA_ARCH__
+      return __dadd_rn(a, b);
+#else
+      return a + b;
+#endif
+    }
+
+    /**
+     * The interval along z at (x, y); false if empty. Infinite ends are +-HUGE_VAL.
+     */
+    MASKER_HD bool interval(double x, double y, double &z0, double &z1) const {
+      z0 = -HUGE_VAL;
+      z1 = HUGE_VAL;
+      if (quadric) {
+        double dx = add(x, -c[0]);
+        double dy = add(y, -c[1]);
+        // q(u) = a u^2 + 2 b u + g, u = z - cz
+        double a = A[8];
+        double b = add(mul(A[2], dx), mul(A[5], dy));
+        double g = add(add(add(mul(mul(A[0], dx), dx), mul(mul(2.0, A[1]), mul(dx, dy))), mul(mul(A[4], dy), dy)), -1.0);
+        if (a > 0) {
+          double disc = add(mul(b, b), -mul(a, g));
+          if (!(disc >= 0)) return false;
+          double s = sqrt(disc);
+          z0 = add(c[2], add(-b, -s) / a);
+          z1 = add(c[2], add(-b, s) / a);
+        } else if (b != 0) {
+          double u = -g / mul(2.0, b);           // the root of 2 b u + g = 0
+          if (b > 0) z1 = add(c[2], u); else z0 = add(c[2], u);
+        } else if (!(g <= 0)) {
+          return false;
+        }
+      }
+      for (int k = 0; k < nplanes; ++k) {
+        double s = add(planes[k][3], -add(mul(planes[k][0], x), mul(planes[k][1], y)));
+        double nz = planes[k][2];
+        if (nz == 0) {
+          if (!(s >= 0)) return false;
+        } else if (nz > 0) {
+          double t = s / nz;
+          if (t < z1) z1 = t;
+        } else {
+          double t = s / nz;
+          if (t > z0) z0 = t;
+        }
+      }
+      return z1 > z0;
+    }
+
+    /**
+     * Length of [z0, z1] inside [zs, ze)
+     */
+    MASKER_HD static double overlap(double z0, double z1, double zs, double ze) {
+      double lo = z0 > zs ? z0 : zs;
+      double hi = z1 < ze ? z1 : ze;
+      return hi > lo ? add(hi, -lo) : 0.0;
+    }
+  };
+
+  /**
+   * A convex region with an optional convex hole: inside = in outer and not in inner. Covers ellipsoids
+   * (with axes and cut planes), boxes at any rotation, slabs with rectangle or disc footprints, and
+   * ellipsoidal shells (outer minus inner). The masks and the exact partial-volume fractions both come from
+   * the two intervals per pixel.
+   */
+  struct ConvexPair {
+    ConvexSet outer;
+    ConvexSet inner;
+    bool has_inner = false;
+
+    MASKER_HD bool inside(double x, double y, double z) const {
+      double a0, a1;
+      if (!outer.interval(x, y, a0, a1) || !(z >= a0 && z < a1)) return false;
+      if (has_inner) {
+        double b0, b1;
+        if (inner.interval(x, y, b0, b1) && z >= b0 && z < b1) return false;
+      }
+      return true;
+    }
+
+    MASKER_HD double fraction(double x, double y, double zs, double ze) const {
+      double a0, a1;
+      if (!outer.interval(x, y, a0, a1)) return 0.0;
+      double f = ConvexSet::overlap(a0, a1, zs, ze);
+      if (f > 0 && has_inner) {
+        double b0, b1;
+        if (inner.interval(x, y, b0, b1)) {
+          // the part of the inner interval inside the outer one
+          double lo = b0 > a0 ? b0 : a0;
+          double hi = b1 < a1 ? b1 : a1;
+          if (hi > lo) f = ConvexSet::add(f, -ConvexSet::overlap(lo, hi, zs, ze));
+        }
+      }
+      return f > 0 ? f / ConvexSet::add(ze, -zs) : 0.0;
+    }
+  };
+
+  /**
+   * The masker for a ConvexPair given in sample coordinates; rotation and translation map it to the microscope
+   * frame as for the other shapes: point(microscope) = R (point(sample) - centre) + centre + translation.
+   * The bounding box is taken over the image's pixel columns (exact for what the image can see).
+   */
+  class ConvexMasker {
+  public:
+
+    using vector3 = std::array<double, 3>;
+
+    ConvexMasker()
+      : xsize_(0), ysize_(0), pixel_size_(1), translation_({0, 0, 0}), rotation_centre_({0, 0, 0}),
+        rotation_vector_({0, 0, 0}), pmin_({0, 0, 0}), pmax_({0, 0, 0}) {}
+
+    std::size_t xsize() const { return xsize_; }
+    std::size_t ysize() const { return ysize_; }
+    std::size_t image_size() const { return xsize_ * ysize_; }
+    double pixel_size() const { return pixel_size_; }
+
+    double xmin() const { extent(); return pmin_[0]; }
+    double ymin() const { extent(); return pmin_[1]; }
+    double zmin() const { extent(); return pmin_[2]; }
+    double xmax() const { extent(); return pmax_[0]; }
+    double ymax() const { extent(); return pmax_[1]; }
+    double zmax() const { extent(); return pmax_[2]; }
+
+    const ConvexPair &microscope() const { return micro_; }
+    const ConvexPair &sample() const { return sample_; }
+
+    const vector3& rotation_origin() const { return rotation_centre_; }
+    double rotation_angle() const { return detail::norm(rotation_vector_); }
+    const vector3& translation() const { return translation_; }
+
+    void set_image_size(std::size_t xsize, std::size_t ysize) {
+      xsize_ = xsize;
+      ysize_ = ysize;
+      update_geometry();
+    }
+
+    void set_pixel_size(double pixel_size) {
+      MULTEM_ASSERT(pixel_size > 0);
+      pixel_size_ = pixel_size;
+      update_geometry();
+    }
+
+    void set_parameters(const ConvexPair &p) {
+      sample_ = p;
+      update_geometry();
+    }
+
+    void set_translation(vector3 translation) {
+      translation_ = translation;
+      update_geometry();
+    }
+
+    void set_rotation(vector3 centre, vector3 rotvec) {
+      rotation_centre_ = centre;
+      rotation_vector_ = rotvec;
+      update_geometry();
+    }
+
+    template <typename Iterator>
+    void compute_mask(double zs, double ze, Iterator iterator) const {
+      MULTEM_ASSERT(ze > zs);
+      double zc = (zs + ze) / 2.0;
+      if (zs < zmax() && ze > zmin()) {
+        for (std::size_t i = 0; i < xsize_; ++i) {
+          for (std::size_t j = 0; j < ysize_; ++j) {
+            *iterator = micro_.inside(ConvexSet::mul((double)i, pixel_size_), ConvexSet::mul((double)j, pixel_size_), zc);
+            ++iterator;
+          }
+        }
+      } else {
+        std::fill(iterator, iterator + image_size(), 0);
+      }
+    }
+
+  protected:
+
+    static void transform(const ConvexSet &s, const double R[9], const vector3 &o, const vector3 &t, ConvexSet &m) {
+      m = s;
+      if (s.quadric) {
+        // A_m = R A R^T; c_m = R (c - o) + o + t
+        double RA[9];
+        for (int r = 0; r < 3; ++r)
+          for (int k = 0; k < 3; ++k)
+            RA[3 * r + k] = R[3 * r + 0] * s.A[0 + k] + R[3 * r + 1] * s.A[3 + k] + R[3 * r + 2] * s.A[6 + k];
+        for (int r = 0; r < 3; ++r)
+          for (int k = 0; k < 3; ++k)
+            m.A[3 * r + k] = RA[3 * r + 0] * R[3 * k + 0] + RA[3 * r + 1] * R[3 * k + 1] + RA[3 * r + 2] * R[3 * k + 2];
+        for (int r = 0; r < 3; ++r)
+          m.c[r] = R[3 * r + 0] * (s.c[0] - o[0]) + R[3 * r + 1] * (s.c[1] - o[1]) + R[3 * r + 2] * (s.c[2] - o[2]) + o[r] + t[r];
+      }
+      for (int k = 0; k < s.nplanes; ++k) {
+        // n.p_s <= d with p_s = R^T (p_m - o - t) + o  ->  (R n).p_m <= d - n.o + (R n).(o + t)
+        const double *n = s.planes[k];
+        double Rn[3];
+        for (int r = 0; r < 3; ++r) Rn[r] = R[3 * r + 0] * n[0] + R[3 * r + 1] * n[1] + R[3 * r + 2] * n[2];
+        double d = n[3] - (n[0] * o[0] + n[1] * o[1] + n[2] * o[2])
+                   + Rn[0] * (o[0] + t[0]) + Rn[1] * (o[1] + t[1]) + Rn[2] * (o[2] + t[2]);
+        m.planes[k][0] = Rn[0]; m.planes[k][1] = Rn[1]; m.planes[k][2] = Rn[2]; m.planes[k][3] = d;
+      }
+    }
+
+    void update_geometry() {
+      double R[9];
+      for (int k = 0; k < 3; ++k) {
+        vector3 e = {0, 0, 0};
+        e[k] = 1;
+        vector3 r = detail::rotate(rotation_vector_, e);
+        R[0 + k] = r[0]; R[3 + k] = r[1]; R[6 + k] = r[2];      // column k = R e_k
+      }
+      transform(sample_.outer, R, rotation_centre_, translation_, micro_.outer);
+      transform(sample_.inner, R, rotation_centre_, translation_, micro_.inner);
+      micro_.has_inner = sample_.has_inner;
+      dirty_ = true;
+    }
+
+    /**
+     * The bounding box over the image's pixel columns, computed when first asked for after a change (one
+     * interval per pixel); an unset masker (no quadric, no planes) is empty.
+     */
+    void extent() const {
+      if (!dirty_) return;
+      dirty_ = false;
+      double lo[3] = {HUGE_VAL, HUGE_VAL, HUGE_VAL}, hi[3] = {-HUGE_VAL, -HUGE_VAL, -HUGE_VAL};
+      bool set = sample_.outer.quadric || sample_.outer.nplanes > 0;
+      for (std::size_t i = 0; set && i < xsize_; ++i) {
+        for (std::size_t j = 0; j < ysize_; ++j) {
+          double x = ConvexSet::mul((double)i, pixel_size_), y = ConvexSet::mul((double)j, pixel_size_);
+          double z0, z1;
+          if (!micro_.outer.interval(x, y, z0, z1)) continue;
+          if (x < lo[0]) lo[0] = x;
+          if (x > hi[0]) hi[0] = x;
+          if (y < lo[1]) lo[1] = y;
+          if (y > hi[1]) hi[1] = y;
+          if (z0 < lo[2]) lo[2] = z0;
+          if (z1 > hi[2]) hi[2] = z1;
+        }
+      }
+      if (!(lo[0] <= hi[0])) {
+        // nothing in view: an empty extent, so a min/max over regions ignores it and no slice is in range
+        pmin_ = {HUGE_VAL, HUGE_VAL, HUGE_VAL};
+        pmax_ = {-HUGE_VAL, -HUGE_VAL, -HUGE_VAL};
+      } else {
+        MULTEM_ASSERT(std::isfinite(lo[2]) && std::isfinite(hi[2]));   // a convex region must be bounded in z
+        pmin_ = {lo[0], lo[1], lo[2]};
+        pmax_ = {hi[0] + pixel_size_, hi[1] + pixel_size_, hi[2]};
+      }
+    }
+
+    std::size_t xsize_;
+    std::size_t ysize_;
+    double pixel_size_;
+    vector3 translation_;
+    vector3 rotation_centre_;
+    vector3 rotation_vector_;
+    ConvexPair sample_;
+    ConvexPair micro_;
+    mutable bool dirty_ = true;
+    mutable vector3 pmin_;
+    mutable vector3 pmax_;
+  };
+
+
   /**
    * A class to represent the GRF ice parameters.
    *
@@ -1344,7 +1638,8 @@ namespace multem {
     enum Shape {
       Cuboid,
       Cylinder,
-      Sphere
+      Sphere,
+      Convex
     };
 
     /**
@@ -1381,6 +1676,13 @@ namespace multem {
      */
     const SphereMasker& sphere_masker() const {
       return sphere_masker_;
+    }
+
+    /**
+     * Get the convex masker
+     */
+    const ConvexMasker& convex_masker() const {
+      return convex_masker_;
     }
 
     /**
@@ -1423,6 +1725,7 @@ namespace multem {
      */
     double xmin() const {
       if (shape() == Sphere) return sphere_masker_.xmin();
+      if (shape() == Convex) return convex_masker_.xmin();
       return shape() == Cuboid
         ? cuboid_masker_.xmin()
         : cylinder_masker_.xmin();
@@ -1433,6 +1736,7 @@ namespace multem {
      */
     double ymin() const {
       if (shape() == Sphere) return sphere_masker_.ymin();
+      if (shape() == Convex) return convex_masker_.ymin();
       return shape() == Cuboid
         ? cuboid_masker_.ymin()
         : cylinder_masker_.ymin();
@@ -1443,6 +1747,7 @@ namespace multem {
      */
     double zmin() const {
       if (shape() == Sphere) return sphere_masker_.zmin();
+      if (shape() == Convex) return convex_masker_.zmin();
       return shape() == Cuboid
         ? cuboid_masker_.zmin()
         : cylinder_masker_.zmin();
@@ -1453,6 +1758,7 @@ namespace multem {
      */
     double xmax() const {
       if (shape() == Sphere) return sphere_masker_.xmax();
+      if (shape() == Convex) return convex_masker_.xmax();
       return shape() == Cuboid
         ? cuboid_masker_.xmax()
         : cylinder_masker_.xmax();
@@ -1463,6 +1769,7 @@ namespace multem {
      */
     double ymax() const {
       if (shape() == Sphere) return sphere_masker_.ymax();
+      if (shape() == Convex) return convex_masker_.ymax();
       return shape() == Cuboid
         ? cuboid_masker_.ymax()
         : cylinder_masker_.ymax();
@@ -1473,6 +1780,7 @@ namespace multem {
      */
     double zmax() const {
       if (shape() == Sphere) return sphere_masker_.zmax();
+      if (shape() == Convex) return convex_masker_.zmax();
       return shape() == Cuboid
         ? cuboid_masker_.zmax()
         : cylinder_masker_.zmax();
@@ -1515,6 +1823,7 @@ namespace multem {
       cuboid_masker_.set_image_size(xsize, ysize);
       cylinder_masker_.set_image_size(xsize, ysize);
       sphere_masker_.set_image_size(xsize, ysize);
+      convex_masker_.set_image_size(xsize, ysize);
     }
 
     /**
@@ -1525,6 +1834,7 @@ namespace multem {
       cuboid_masker_.set_pixel_size(pixel_size);
       cylinder_masker_.set_pixel_size(pixel_size);
       sphere_masker_.set_pixel_size(pixel_size);
+      convex_masker_.set_pixel_size(pixel_size);
     }
 
     /**
@@ -1571,12 +1881,31 @@ namespace multem {
     }
 
     /**
+     * Set a convex region (sample coordinates): an optional quadric (p - c)^T A (p - c) <= 1 (A row-major,
+     * symmetric positive semi-definite; empty = none) intersected with half-spaces n.p <= d (nx, ny, nz, d),
+     * minus an optional inner convex set given the same way (has_inner). Ellipsoids with axes and cuts,
+     * rotated boxes, slabs and ellipsoidal shells are all of this form.
+     */
+    void set_convex(
+        std::vector<double> A, std::array<double, 3> centre, std::vector<std::array<double, 4>> planes,
+        bool has_inner, std::vector<double> inner_A, std::array<double, 3> inner_centre,
+        std::vector<std::array<double, 4>> inner_planes) {
+      ConvexPair p;
+      fill_set(A, centre, planes, p.outer);
+      p.has_inner = has_inner;
+      if (has_inner) fill_set(inner_A, inner_centre, inner_planes, p.inner);
+      shape_ = Convex;
+      convex_masker_.set_parameters(p);
+    }
+
+    /**
      * Set a translation along the x axis
      */
     void set_translation(std::array<double, 3> translation) {
       cuboid_masker_.set_translation(translation);
       cylinder_masker_.set_translation(translation);
       sphere_masker_.set_translation(translation);
+      convex_masker_.set_translation(translation);
     }
 
     /**
@@ -1586,6 +1915,7 @@ namespace multem {
       cuboid_masker_.set_rotation(centre, rotvec);
       cylinder_masker_.set_rotation(centre, rotvec);
       sphere_masker_.set_rotation(centre, rotvec);
+      convex_masker_.set_rotation(centre, rotvec);
     }
    
     /**
@@ -1599,6 +1929,8 @@ namespace multem {
         cylinder_masker_.compute_mask(zs, ze, iterator);
       } else if (shape_ == Sphere) {
         sphere_masker_.compute_mask(zs, ze, iterator);
+      } else if (shape_ == Convex) {
+        convex_masker_.compute_mask(zs, ze, iterator);
       } else {
         MULTEM_ASSERT(false); // Should never reach here
       }
@@ -1648,7 +1980,32 @@ namespace multem {
     CuboidMasker cuboid_masker_;
     CylinderMasker cylinder_masker_;
     SphereMasker sphere_masker_;
+    ConvexMasker convex_masker_;
     IceParameters ice_parameters_;
+
+    static void fill_set(const std::vector<double> &A, const std::array<double, 3> &c,
+                         const std::vector<std::array<double, 4>> &planes, ConvexSet &s) {
+      MULTEM_ASSERT(A.empty() || A.size() == 9);
+      MULTEM_ASSERT((int)planes.size() <= ConvexSet::MAX_PLANES);
+      s.quadric = !A.empty();
+      for (int k = 0; k < 9; ++k) s.A[k] = 0.0;
+      if (s.quadric) {
+        // symmetric to rounding (U diag U^T computed in floating point is not exactly symmetric); symmetrise
+        double amax = 0;
+        for (int k = 0; k < 9; ++k) amax = std::max(amax, std::abs(A[k]));
+        for (int r = 0; r < 3; ++r)
+          for (int k = 0; k < 3; ++k) {
+            MULTEM_ASSERT(std::abs(A[3 * r + k] - A[3 * k + r]) <= 1e-12 * amax);
+            s.A[3 * r + k] = 0.5 * (A[3 * r + k] + A[3 * k + r]);
+          }
+        MULTEM_ASSERT(s.A[0] >= 0 && s.A[4] >= 0 && s.A[8] >= 0);
+      }
+      for (int k = 0; k < 3; ++k) s.c[k] = c[k];
+      s.nplanes = (int)planes.size();
+      for (int k = 0; k < s.nplanes; ++k)
+        for (int m = 0; m < 4; ++m) s.planes[k][m] = planes[k][m];
+      MULTEM_ASSERT(s.quadric || s.nplanes > 0);
+    }
     long long seed_ = -1;
     int partial_volume_ = 0;
   };

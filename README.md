@@ -95,7 +95,16 @@ material (`IceParameters`) and regions it subtracts.
 - **Spectrum.** `IceParameters.set_spectrum_table(q, P)` replaces the two-Gaussian power spectrum with a
   table (it needs the band-limited potential). `v0` is then the variance per molecule over the table's own
   range.
+- **Convex regions.** `Masker.set_convex(A, centre, planes, has_inner, inner_A, inner_centre, inner_planes)`
+  takes an optional quadric (p − c)ᵀA(p − c) ≤ 1 (an ellipsoid, or an elliptic cylinder when A is singular, at any
+  orientation) intersected with up to 16 half-spaces n·p ≤ d. It can subtract an inner set given the same way.
+  Ellipsoids with cuts, boxes at any rotation, slabs with a rectangle or disc footprint, and ellipsoidal shells all
+  take this form. A ray along z meets such a set in one interval, so partial-volume fractions are exact here too.
+  The masker's rotation and translation apply as for the other shapes.
 - **Vacuum.** A region with density 0 adds nothing, and other regions can still subtract its shape.
+- **Test hooks.** `compute_mask_engine`, `compute_fraction_engine` and `compute_region_labels_engine` return what
+  the simulation computes for one slice. The last gives each pixel's owning region after subtractions: its index,
+  −1 for none, or −2 for an overlap.
 - **Statistics.** `ice_slice_statistics(ice, dx, dy, dz)` returns the mean and sigma the engine gives one
   slice of a material, and whether the band-limited potential was in force.
 

@@ -927,6 +927,43 @@ namespace multem {
     }
 
     /**
+     * A convex region's mask and exact fraction for one slice, on host or device (the same arithmetic as
+     * ConvexMasker::compute_mask, so the masks are identical).
+     */
+    template <typename T>
+    struct ConvexMaskSlice {
+      ConvexPair pair;
+      double zs, ze, pixel_size;
+      std::size_t ysize;
+      bool fraction;
+
+      ConvexMaskSlice(const ConvexPair &p, double zs_, double ze_, double pixel_size_, std::size_t ysize_, bool fraction_)
+        : pair(p), zs(zs_), ze(ze_), pixel_size(pixel_size_), ysize(ysize_), fraction(fraction_) {}
+
+      DEVICE_CALLABLE
+      T operator()(size_t index) const {
+        size_t i = index / ysize;
+        size_t j = index - i * ysize;
+        double x = ConvexSet::mul((double)i, pixel_size);
+        double y = ConvexSet::mul((double)j, pixel_size);
+        if (fraction) return T(pair.fraction(x, y, zs, ze));
+        return T(pair.inside(x, y, (zs + ze) / 2.0) ? 1 : 0);
+      }
+    };
+
+    template <typename Iterator>
+    void compute_mask(const ConvexMasker &masker, double zs, double ze, Iterator iterator) {
+      MULTEM_ASSERT(ze > zs);
+      if (zs < masker.zmax() && ze > masker.zmin()) {
+        thrust::counting_iterator<size_t> indices(0);
+        thrust::transform(indices, indices + masker.image_size(), iterator,
+            ConvexMaskSlice<bool>(masker.microscope(), zs, ze, masker.pixel_size(), masker.ysize(), false));
+      } else {
+        thrust::fill(iterator, iterator + masker.image_size(), 0);
+      }
+    }
+
+    /**
      * Compute mask
      */
     template <typename Iterator>
@@ -937,6 +974,8 @@ namespace multem {
         compute_mask(masker.cylinder_masker(), zs, ze, iterator);
       } else if (masker.shape() == Masker::Sphere) {
         compute_mask(masker.sphere_masker(), zs, ze, iterator);
+      } else if (masker.shape() == Masker::Convex) {
+        compute_mask(masker.convex_masker(), zs, ze, iterator);
       } else {
         MULTEM_ASSERT(false); // Unknown shape
       }
@@ -1085,6 +1124,17 @@ namespace multem {
         const Masker &masker, double zs, double ze, int n, FracVector &frac, BoolVector &scratch) {
       using T = typename FracVector::value_type;
       MULTEM_ASSERT(n > 0 && ze > zs);
+      if (masker.shape() == Masker::Convex) {
+        const auto &m = masker.convex_masker();
+        if (!(zs < m.zmax() && ze > m.zmin())) {
+          thrust::fill(frac.begin(), frac.end(), T(0));
+          return;
+        }
+        thrust::counting_iterator<size_t> indices(0);
+        thrust::transform(indices, indices + m.image_size(), frac.begin(),
+            ConvexMaskSlice<T>(m.microscope(), zs, ze, m.pixel_size(), m.ysize(), true));
+        return;
+      }
       if (masker.shape() == Masker::Sphere || masker.shape() == Masker::Cuboid) {
         bool in_range = (masker.shape() == Masker::Sphere)
           ? (zs < masker.sphere_masker().zmax() && ze > masker.sphere_masker().zmin())
@@ -3549,6 +3599,35 @@ namespace multem {
       std::copy(f.begin(), f.end(), out.begin());
     }
     return out;
+  }
+
+  std::vector<int> compute_region_labels_engine(
+      const MultiRegionMasker &masker, double zs, double ze, bool device) {
+    // per pixel, the one region whose final 0/1 mask (after its subtractions) is set in this slice:
+    // its index, -1 for none, -2 for more than one (an overlap the scene did not resolve). For tests.
+    std::size_t n = masker.image_size();
+    std::vector<int> labels(n, -1);
+    std::vector<char> m(n);
+    for (std::size_t r = 0; r < masker.num_regions(); ++r) {
+      if (device) {
+#ifndef MULTEM_NO_CUDA
+        mt::Vector<bool, mt::e_device> out(n), scratch(n);
+        detail::compute_region_mask(masker, r, zs, ze, out, scratch);
+        mt::Vector<bool, mt::e_host> h(n);
+        thrust::copy(out.begin(), out.end(), h.begin());
+        std::copy(h.begin(), h.end(), m.begin());
+#else
+        MULTEM_ASSERT(!device);
+#endif
+      } else {
+        mt::Vector<bool, mt::e_host> out(n), scratch(n);
+        detail::compute_region_mask(masker, r, zs, ze, out, scratch);
+        std::copy(out.begin(), out.end(), m.begin());
+      }
+      for (std::size_t k = 0; k < n; ++k)
+        if (m[k]) labels[k] = (labels[k] == -1) ? (int)r : -2;
+    }
+    return labels;
   }
 
   std::vector<int> compute_mask_engine(const Masker &masker, double zs, double ze, bool device) {
