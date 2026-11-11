@@ -2023,9 +2023,10 @@ namespace multem {
     Masker shape;
     IceParameters material;
     std::vector<int> subtract_regions;  // indices of regions to subtract
+    unsigned long long key;  // the region's key for the keyed random field (see set_keyed_grf)
 
     MaskerRegion()
-      : subtract_regions() {}
+      : subtract_regions(), key(0) {}
   };
 
 
@@ -2058,11 +2059,13 @@ namespace multem {
     void add_region(
         const Masker &shape,
         const IceParameters &material,
-        const std::vector<int> &subtract_regions = std::vector<int>()) {
+        const std::vector<int> &subtract_regions = std::vector<int>(),
+        unsigned long long key = 0) {
       MaskerRegion region;
       region.shape = shape;
       region.material = material;
       region.subtract_regions = subtract_regions;
+      region.key = key;
       regions_.push_back(region);
     }
 
@@ -2090,9 +2093,11 @@ namespace multem {
     double pixel_size() const { return pixel_size_; }
 
     /**
-     * Get the z-extent across all regions
+     * Get the z-extent across all regions. With a slice origin set (set_slice_origin), the extent is
+     * widened outwards to the nearest planes z_ref + k dz, so that the slices the simulation cuts between
+     * zmin and zmax lie on one lattice whatever the regions are; without one it is the regions' own extent.
      */
-    double zmin() const {
+    double zmin_unsnapped() const {
       double z = 1e10;
       for (auto &r : regions_) {
         z = std::min(z, r.shape.zmin());
@@ -2100,13 +2105,67 @@ namespace multem {
       return z;
     }
 
-    double zmax() const {
+    double zmax_unsnapped() const {
       double z = -1e10;
       for (auto &r : regions_) {
         z = std::max(z, r.shape.zmax());
       }
       return z;
     }
+
+    double zmin() const {
+      double z = zmin_unsnapped();
+      return has_slice_origin_ ? z_ref_ + std::floor((z - z_ref_) / dz_) * dz_ : z;
+    }
+
+    double zmax() const {
+      double z = zmax_unsnapped();
+      return has_slice_origin_ ? z_ref_ + std::ceil((z - z_ref_) / dz_) * dz_ : z;
+    }
+
+    /**
+     * Anchor the slice lattice: zmin and zmax are widened to planes z_ref + k dz (dz the simulation's slice
+     * thickness), so the same z_ref gives slices at the same z whatever regions are present.
+     */
+    void set_slice_origin(double z_ref, double dz) {
+      MULTEM_ASSERT(dz > 0);
+      z_ref_ = z_ref;
+      dz_ = dz;
+      has_slice_origin_ = true;
+    }
+
+    void clear_slice_origin() {
+      has_slice_origin_ = false;
+    }
+
+    bool has_slice_origin() const { return has_slice_origin_; }
+    double slice_origin() const { return z_ref_; }
+    double slice_spacing() const { return dz_; }
+
+    /**
+     * The keyed random field. When on, each region's field on a slice is a function of the seed, the
+     * region's key and the slice's index k on the slice lattice alone (k from the slice origin, which must
+     * be set; the seed must be >= 0): fields come in pairs (k = 2p, 2p + 1 take the real and imaginary parts
+     * of one transform), each element's phase is a 64-bit counter-based hash of (seed, key, p, element).
+     * The field no longer depends on the order of the regions, on which other regions are present, or on
+     * the slices before. A region with nothing on a slice is then skipped (see set_skip_empty). Off (the
+     * default) keeps the shared sequential random field, unchanged.
+     */
+    void set_keyed_grf(bool keyed) {
+      keyed_grf_ = keyed;
+    }
+
+    bool keyed_grf() const { return keyed_grf_; }
+
+    /**
+     * With the keyed field, skip a region whose mask (or fraction) is zero over the whole slice (the
+     * default). Off forces every region's field to be drawn, for testing that skipping changes nothing.
+     */
+    void set_skip_empty(bool skip) {
+      skip_empty_ = skip;
+    }
+
+    bool skip_empty() const { return skip_empty_; }
 
     /**
      * Set rotation for ALL regions (tilt-series support)
@@ -2166,6 +2225,11 @@ namespace multem {
     std::vector<MaskerRegion> regions_;
     long long seed_ = -1;
     int partial_volume_ = 0;
+    bool has_slice_origin_ = false;
+    double z_ref_ = 0;
+    double dz_ = 1;
+    bool keyed_grf_ = false;
+    bool skip_empty_ = true;
   };
 }
 

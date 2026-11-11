@@ -13,11 +13,13 @@
 #include <iostream>
 #include <stdexcept>
 #include <algorithm>
+#include <numeric>
 #include <array>
 #include <map>
 #include <string>
 #include <cuda_runtime.h>
 #include <thrust/random.h>
+#include <thrust/logical.h>
 #include <types.cuh>
 #include <input_multislice.cuh>
 #include <xtl_build.hpp>
@@ -1571,6 +1573,60 @@ namespace multem {
     };
 
     /**
+     * splitmix64 (Steele, Lea and Flood 2014): a 64-bit finaliser, used as a counter-based random number
+     * generator -- the value for a counter is a function of the counter alone, with no state or period.
+     */
+    DEVICE_CALLABLE inline unsigned long long splitmix64(unsigned long long x) {
+      x += 0x9E3779B97F4A7C15ULL;
+      x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+      x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+      return x ^ (x >> 31);
+    }
+
+    /**
+     * The key of one keyed random field: the seed, the region's key and the pair index p (slices 2p and
+     * 2p + 1 share one transform)
+     */
+    inline unsigned long long keyed_field_seed(long long seed, unsigned long long region_key, long long pair) {
+      unsigned long long s = splitmix64(static_cast<unsigned long long>(seed));
+      s = splitmix64(s ^ region_key);
+      return splitmix64(s ^ static_cast<unsigned long long>(pair));
+    }
+
+    /**
+     * The FT of a keyed random field: element i's phase is 2 pi u, u = 53 bits of splitmix64(seed ^
+     * splitmix64(i)) in [0, 1). Each value depends on (seed, i) only.
+     */
+    template <typename T>
+    struct ComputeKeyedRandomField {
+
+      unsigned long long seed;
+
+      ComputeKeyedRandomField(unsigned long long seed_)
+        : seed(seed_) {}
+
+      template <typename U>
+      DEVICE_CALLABLE
+      T operator()(size_t index, U amplitude) const {
+        unsigned long long h = splitmix64(seed ^ splitmix64(static_cast<unsigned long long>(index)));
+        double u = static_cast<double>(h >> 11) * (1.0 / 9007199254740992.0);
+        double phase = 2 * M_PI * u;
+        return (T)(amplitude) * exp(T(0, phase));
+      }
+    };
+
+    /**
+     * Whether any element of a mask or fraction is non-zero
+     */
+    struct IsNonZero {
+      template <typename U>
+      DEVICE_CALLABLE
+      bool operator()(const U x) const {
+        return x != U(0);
+      }
+    };
+
+    /**
      * A functor to mask and normalize the gaussian field
      */
     struct MaskAndNormalize {
@@ -2121,11 +2177,16 @@ namespace multem {
         mt::Vector<T_r, DeviceType> random_field;
         std::vector<double> spectrum_q;
         std::vector<double> spectrum_P;
+        unsigned long long key;     // the region's key (keyed field)
+        bool amplitude_ready;       // the keyed field's amplitude is computed for this grid
+        bool pair_valid;            // fft_data holds the keyed transform of pair cached_pair
+        long long cached_pair;
 
         RegionState()
           : a1(0.199), a2(0.801), m1(0), m2(1.0/2.88),
             s1(0.731), s2(0.081), density(0.91),
-            m0(-1), v0(-1), fft_data_counter(0) {}
+            m0(-1), v0(-1), fft_data_counter(0), key(0),
+            amplitude_ready(false), pair_valid(false), cached_pair(0) {}
 
         void set_from_ice_parameters(const IceParameters &p) {
           m1 = p.m1; m2 = p.m2;
@@ -2144,6 +2205,8 @@ namespace multem {
           fft_data.resize(size);
           random_field.resize(size);
           fft_data_counter = 0;
+          amplitude_ready = false;
+          pair_valid = false;
         }
       };
 
@@ -2157,6 +2220,8 @@ namespace multem {
       mt::Vector<bool, DeviceType> scratch_mask_;  // for boolean SUBTRACT
       mt::Vector<T_r, DeviceType> scratch_fraction_;  // for partial-volume SUBTRACT
       mt::Vector<T_r, DeviceType> region_sum_;  // all regions' fields for this slice
+      std::vector<std::size_t> key_order_;  // region indices by ascending key (the keyed draw's sum order)
+      bool keys_unique_ = true;
 
       MultiMaterialPotentialApproximation()
         : gen_(std::random_device()()),
@@ -2172,6 +2237,20 @@ namespace multem {
         regions_.resize(masker.num_regions());
         for (std::size_t i = 0; i < masker.num_regions(); ++i) {
           regions_[i].set_from_ice_parameters(masker.region(i).material);
+          regions_[i].key = masker.region(i).key;
+        }
+        // With the keyed draw, regions are summed in ascending key order, so a slice's sum does not depend
+        // on the order the regions were added in (floating-point addition is not associative)
+        key_order_.resize(regions_.size());
+        std::iota(key_order_.begin(), key_order_.end(), std::size_t(0));
+        std::stable_sort(key_order_.begin(), key_order_.end(), [this](std::size_t a, std::size_t b) {
+          return regions_[a].key < regions_[b].key;
+        });
+        keys_unique_ = true;
+        for (std::size_t n = 1; n < key_order_.size(); ++n) {
+          if (regions_[key_order_[n]].key == regions_[key_order_[n - 1]].key) {
+            keys_unique_ = false;
+          }
         }
       }
 
@@ -2194,6 +2273,8 @@ namespace multem {
           y_pixel_size_ = y_pixel_size;
           for (auto &r : regions_) {
             r.fft_data_counter = 0;
+            r.amplitude_ready = false;
+            r.pair_valid = false;
           }
         }
       }
@@ -2347,6 +2428,17 @@ namespace multem {
           mt::assign_imag(reg.fft_data, reg.random_field);
         }
 
+        normalize_and_mask(reg, mean, sigma);
+
+        reg.fft_data_counter++;
+      }
+
+      /**
+       * Scale a region's random field to the slice's mean and sigma and mask it (or weight it by the
+       * partial-volume fraction)
+       */
+      void normalize_and_mask(RegionState &reg, double mean, double sigma) {
+
         // Normalize
         MULTEM_ASSERT(reg.random_field.size() > 0);
         double rf_mean = thrust::reduce(
@@ -2375,8 +2467,64 @@ namespace multem {
               reg.random_field.begin(),
               MaskAndNormalize(sigma/sdev, mean - rf_mean*sigma/sdev));
         }
+      }
 
-        reg.fft_data_counter++;
+      /**
+       * The region's amplitude (its field's spectrum on this grid), once per grid
+       */
+      void compute_region_amplitude(RegionState &reg) {
+        std::size_t xsize = grid_2d_.nx;
+        std::size_t ysize = grid_2d_.ny;
+        std::size_t size = xsize * ysize;
+        if (!reg.spectrum_q.empty()) {
+          MULTEM_ASSERT(band_limited_potential());
+          compute_table_amplitude(reg.amplitude, xsize, ysize, x_pixel_size_, y_pixel_size_,
+              band_limit_spacing(x_pixel_size_, y_pixel_size_), reg.spectrum_q, reg.spectrum_P);
+        } else {
+          thrust::counting_iterator<size_t> indices(0);
+          thrust::transform(
+              indices, indices + size,
+              reg.amplitude.begin(),
+              ComputeGaussianRandomFieldAmplitude<T_r>(
+                reg.a1, reg.a2, reg.m1, reg.m2, reg.s1, reg.s2,
+                xsize, ysize, x_pixel_size_, y_pixel_size_,
+                band_limited_potential()
+                  ? band_limit_spacing(x_pixel_size_, y_pixel_size_)
+                  : 0.0));
+        }
+        reg.amplitude_ready = true;
+      }
+
+      /**
+       * The keyed random field of a region on slice k = 2 pair + (odd ? 1 : 0): a function of the seed,
+       * the region's key and k alone. One transform serves the pair (real part for even k, imaginary for
+       * odd); it is kept, so the pair's other slice does not redo it.
+       */
+      void compute_keyed_grf_for_region(
+          RegionState &reg, long long pair, bool odd, double mean, double sigma) {
+        std::size_t size = grid_2d_.nx * grid_2d_.ny;
+        if (!reg.amplitude_ready) {
+          compute_region_amplitude(reg);
+        }
+        if (!reg.pair_valid || reg.cached_pair != pair) {
+          MULTEM_ASSERT(masker_.seed() >= 0);
+          thrust::counting_iterator<size_t> indices(0);
+          thrust::transform(
+              indices, indices + size,
+              reg.amplitude.begin(),
+              reg.fft_data.begin(),
+              ComputeKeyedRandomField<T_c>(keyed_field_seed(masker_.seed(), reg.key, pair)));
+          mt::fft2_shift(grid_2d_, reg.fft_data);
+          fft_2d_->inverse(reg.fft_data);
+          reg.cached_pair = pair;
+          reg.pair_valid = true;
+        }
+        if (odd) {
+          mt::assign_imag(reg.fft_data, reg.random_field);
+        } else {
+          mt::assign_real(reg.fft_data, reg.random_field);
+        }
+        normalize_and_mask(reg, mean, sigma);
       }
 
       /**
@@ -2401,7 +2549,23 @@ namespace multem {
         MULTEM_ASSERT(region_sum_.size() == V_0.size());
         thrust::fill(region_sum_.begin(), region_sum_.end(), T_r(0));
 
-        for (std::size_t i = 0; i < regions_.size(); ++i) {
+        // The keyed field: the slice's index k on the lattice (from its midpoint, so a lattice offset by
+        // half a slice gives the same k), and the pair it belongs to
+        const bool keyed = masker_.keyed_grf();
+        long long pair = 0;
+        bool odd = false;
+        if (keyed) {
+          MULTEM_ASSERT(masker_.has_slice_origin());
+          MULTEM_ASSERT(masker_.seed() >= 0);
+          MULTEM_ASSERT(keys_unique_);  // two regions with one key would draw the same field
+          double k = std::floor((0.5 * (z_0 + z_e) - masker_.slice_origin()) / masker_.slice_spacing());
+          long long kk = static_cast<long long>(k);
+          pair = (kk >= 0) ? kk / 2 : -((-kk + 1) / 2);
+          odd = (kk - 2 * pair) != 0;
+        }
+
+        for (std::size_t n = 0; n < regions_.size(); ++n) {
+          const std::size_t i = keyed ? key_order_[n] : n;
           auto &reg = regions_[i];
 
           // A vacuum region (density <= 0) adds nothing. It exists so that other regions can
@@ -2421,13 +2585,27 @@ namespace multem {
             compute_region_mask(masker_, i, z_0, z_e, reg.mask, scratch_mask_);
           }
 
+          // With the keyed field, a region with nothing on this slice adds nothing and draws nothing
+          if (keyed && masker_.skip_empty()) {
+            bool any = (masker_.partial_volume() > 0)
+              ? thrust::any_of(reg.fraction.begin(), reg.fraction.end(), IsNonZero())
+              : thrust::any_of(reg.mask.begin(), reg.mask.end(), IsNonZero());
+            if (!any) {
+              continue;
+            }
+          }
+
           // Compute GRF statistics for this material
           double number_density = compute_number_density_of_water(reg.density);
           double mean = compute_mean(thickness * number_density, reg.m0);
           double sigma = compute_sigma(thickness * number_density, reg.v0, reg);
 
           // Generate and mask the GRF
-          compute_grf_for_region(reg, mean, sigma);
+          if (keyed) {
+            compute_keyed_grf_for_region(reg, pair, odd, mean, sigma);
+          } else {
+            compute_grf_for_region(reg, mean, sigma);
+          }
 
           // Shift the grid
           mt::fft2_shift(grid_2d_, reg.random_field);
@@ -3299,6 +3477,23 @@ namespace multem {
    * @param input The input object
    * @returns The output results
    */
+  /**
+   * The occupancy of the two atoms that mark the masker's z range for MULTEM's slicing.
+   *
+   * They are hydrogens at pixel (0, 0), so by default they also add two atoms' potential to the first
+   * and last slices, at a z that follows the masker's extent. With a slice origin set (a fixed slice
+   * lattice), they get occupancy 0: MULTEM still slices on them (it keeps every atom and scales its
+   * potential by the occupancy), and they add nothing, so a slice does not change when the extent does.
+   */
+  template <typename Masker>
+  inline double slicing_atom_occupancy(const Masker &) {
+    return 1.0;
+  }
+
+  inline double slicing_atom_occupancy(const MultiRegionMasker &masker) {
+    return masker.has_slice_origin() ? 0.0 : 1.0;
+  }
+
   template <typename FloatType, mt::eDevice DeviceType, typename Masker>
   Output run_multislice(SystemConfiguration config, Input input, const Masker &masker) {
 
@@ -3306,8 +3501,8 @@ namespace multem {
     // because if multem has no atoms it gets confused. By adding an atom at
     // the minimum and maximum Z locations we make multem create slices between
     // those two atoms.
-    input.spec_atoms.push_back(Atom(1, 0, 0, masker.zmin(), 0, 1, 0, 0));
-    input.spec_atoms.push_back(Atom(1, 0, 0, masker.zmax(), 0, 1, 0, 0));
+    input.spec_atoms.push_back(Atom(1, 0, 0, masker.zmin(), 0, slicing_atom_occupancy(masker), 0, 0));
+    input.spec_atoms.push_back(Atom(1, 0, 0, masker.zmax(), 0, slicing_atom_occupancy(masker), 0, 0));
 
     // Initialise the system configuration and input structures 
     auto system_conf = detail::read_system_configuration(config);
@@ -3376,8 +3571,8 @@ namespace multem {
       const MultiRegionMasker &masker) {
 
     // Add sentinel atoms at z extremes (same pattern as single-masker variant)
-    input.spec_atoms.push_back(Atom(1, 0, 0, masker.zmin(), 0, 1, 0, 0));
-    input.spec_atoms.push_back(Atom(1, 0, 0, masker.zmax(), 0, 1, 0, 0));
+    input.spec_atoms.push_back(Atom(1, 0, 0, masker.zmin(), 0, slicing_atom_occupancy(masker), 0, 0));
+    input.spec_atoms.push_back(Atom(1, 0, 0, masker.zmax(), 0, slicing_atom_occupancy(masker), 0, 0));
 
     // Initialise the system configuration and input structures
     auto system_conf = detail::read_system_configuration(config);
@@ -3408,8 +3603,8 @@ namespace multem {
       SystemConfiguration config, Input input, const MultiRegionMasker &masker) {
 
     // Add hydrogen atoms at z extremes so MULTEM creates slices
-    input.spec_atoms.push_back(Atom(1, 0, 0, masker.zmin(), 0, 1, 0, 0));
-    input.spec_atoms.push_back(Atom(1, 0, 0, masker.zmax(), 0, 1, 0, 0));
+    input.spec_atoms.push_back(Atom(1, 0, 0, masker.zmin(), 0, slicing_atom_occupancy(masker), 0, 0));
+    input.spec_atoms.push_back(Atom(1, 0, 0, masker.zmax(), 0, slicing_atom_occupancy(masker), 0, 0));
 
     auto system_conf = detail::read_system_configuration(config);
     auto input_multislice = detail::read_input_multislice<FloatType>(input);
@@ -3491,8 +3686,8 @@ namespace multem {
     // because if multem has no atoms it gets confused. By adding an atom at
     // the minimum and maximum Z locations we make multem create slices between
     // those two atoms.
-    input.spec_atoms.push_back(Atom(1, 0, 0, masker.zmin(), 0, 1, 0, 0));
-    input.spec_atoms.push_back(Atom(1, 0, 0, masker.zmax(), 0, 1, 0, 0));
+    input.spec_atoms.push_back(Atom(1, 0, 0, masker.zmin(), 0, slicing_atom_occupancy(masker), 0, 0));
+    input.spec_atoms.push_back(Atom(1, 0, 0, masker.zmax(), 0, slicing_atom_occupancy(masker), 0, 0));
 
     // Initialise the system configuration and input structures 
     auto system_conf = detail::read_system_configuration(config);

@@ -1405,6 +1405,7 @@ PYBIND11_MODULE(multem_ext, m)
     .def_readwrite("shape", &multem::MaskerRegion::shape)
     .def_readwrite("material", &multem::MaskerRegion::material)
     .def_readwrite("subtract_regions", &multem::MaskerRegion::subtract_regions)
+    .def_readwrite("key", &multem::MaskerRegion::key)
     ;
 
   // Wrap the multem::MultiRegionMasker class
@@ -1414,7 +1415,10 @@ PYBIND11_MODULE(multem_ext, m)
     .def("add_region", &multem::MultiRegionMasker::add_region,
          py::arg("shape"),
          py::arg("material"),
-         py::arg("subtract_regions") = std::vector<int>())
+         py::arg("subtract_regions") = std::vector<int>(),
+         py::arg("key") = 0ULL,
+         "Add a region; key identifies it to the keyed random field (set_keyed_grf), and should not depend "
+         "on the region's position in the list")
     .def("num_regions", &multem::MultiRegionMasker::num_regions)
     .def("set_seed", &multem::MultiRegionMasker::set_seed, py::arg("seed"),
          "Seed the shared random field: >= 0 reproducible, negative (default -1) fresh each time")
@@ -1430,12 +1434,30 @@ PYBIND11_MODULE(multem_ext, m)
     .def("pixel_size", &multem::MultiRegionMasker::pixel_size)
     .def("zmin", &multem::MultiRegionMasker::zmin)
     .def("zmax", &multem::MultiRegionMasker::zmax)
+    .def("zmin_unsnapped", &multem::MultiRegionMasker::zmin_unsnapped)
+    .def("zmax_unsnapped", &multem::MultiRegionMasker::zmax_unsnapped)
+    .def("set_slice_origin", &multem::MultiRegionMasker::set_slice_origin, py::arg("z_ref"), py::arg("dz"),
+         "Anchor the slice lattice: zmin and zmax widen to planes z_ref + k dz")
+    .def("clear_slice_origin", &multem::MultiRegionMasker::clear_slice_origin)
+    .def("has_slice_origin", &multem::MultiRegionMasker::has_slice_origin)
+    .def("slice_origin", &multem::MultiRegionMasker::slice_origin)
+    .def("slice_spacing", &multem::MultiRegionMasker::slice_spacing)
+    .def("set_keyed_grf", &multem::MultiRegionMasker::set_keyed_grf, py::arg("keyed"),
+         "Draw each region's field from (seed, region key, slice index) alone; needs a slice origin and a "
+         "seed >= 0. Off (the default) keeps the shared sequential field")
+    .def("keyed_grf", &multem::MultiRegionMasker::keyed_grf)
+    .def("set_skip_empty", &multem::MultiRegionMasker::set_skip_empty, py::arg("skip"),
+         "With the keyed field, skip regions with nothing on a slice (default); off draws them anyway")
+    .def("skip_empty", &multem::MultiRegionMasker::skip_empty)
     .def("set_rotation", &multem::MultiRegionMasker::set_rotation)
     .def("set_translation", &multem::MultiRegionMasker::set_translation)
     ;
   // A region with density <= 0 is vacuum: it adds no random field, and other regions can still
   // subtract its shape. Engines without this reject such a region.
   multi_region_masker.attr("supports_vacuum_regions") = py::bool_(true);
+  // Region keys, the slice origin and the keyed random field (set_keyed_grf): engines without them
+  // have none of these methods.
+  multi_region_masker.attr("supports_keyed_grf") = py::bool_(true);
 
   // Expose the simulation function
   //
