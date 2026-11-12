@@ -844,6 +844,13 @@ namespace multem {
   std::vector<int> compute_mask_engine(const Masker &masker, double zs, double ze, bool device);
 
   /**
+   * One region's partial-volume fraction of a slice after its subtractions, composed as the simulation
+   * composes it (the masker's region composition), on the host or the device (for tests).
+   */
+  std::vector<double> compute_region_fraction_engine(
+      const MultiRegionMasker &masker, int region, double zs, double ze, bool device);
+
+  /**
    * Per pixel, the region of a multi-region masker that owns one slice (its final 0/1 mask after
    * subtractions): the index, -1 for none, -2 for more than one (for tests).
    */

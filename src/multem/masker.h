@@ -2168,6 +2168,26 @@ namespace multem {
     bool skip_empty() const { return skip_empty_; }
 
     /**
+     * How a region's partial-volume fraction takes off the regions it subtracts. "interval" (the default):
+     * the region's own part of the pixel's column through the slice, less the union of the subtracted
+     * regions' parts, from each shape's interval(s) along the column; exact for convex sets with an
+     * optional convex hole (ellipsoids, shells, cut shells, boxes, slabs), spheres and cuboids, whether the
+     * subtracted regions lie inside the region, abut it, or nest inside each other. A region that meets a
+     * cylinder in a slice falls back to "legacy". "legacy": f_self minus each subtracted region's whole
+     * fraction, clipped at 0, which is exact only where every subtracted part of the column lies inside the
+     * region's own part (it takes material from a region that a subtracted region only abuts, and twice
+     * where two subtracted regions nest). Kept so that results made with it can be reproduced.
+     */
+    void set_region_composition(const std::string &mode) {
+      MULTEM_ASSERT(mode == "interval" || mode == "legacy");
+      interval_composition_ = (mode == "interval");
+    }
+
+    std::string region_composition() const { return interval_composition_ ? "interval" : "legacy"; }
+
+    bool interval_composition() const { return interval_composition_; }
+
+    /**
      * Set rotation for ALL regions (tilt-series support)
      */
     void set_rotation(
@@ -2230,6 +2250,7 @@ namespace multem {
     double dz_ = 1;
     bool keyed_grf_ = false;
     bool skip_empty_ = true;
+    bool interval_composition_ = true;
   };
 }
 

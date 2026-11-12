@@ -1449,6 +1449,11 @@ PYBIND11_MODULE(multem_ext, m)
     .def("set_skip_empty", &multem::MultiRegionMasker::set_skip_empty, py::arg("skip"),
          "With the keyed field, skip regions with nothing on a slice (default); off draws them anyway")
     .def("skip_empty", &multem::MultiRegionMasker::skip_empty)
+    .def("set_region_composition", &multem::MultiRegionMasker::set_region_composition, py::arg("mode"),
+         "How a region's partial-volume fraction takes off the regions it subtracts: \"interval\" (the "
+         "default; its part of each pixel's column less the union of theirs, exact for convex sets, shells, "
+         "spheres and cuboids) or \"legacy\" (f_self minus each one's whole fraction, clipped at 0)")
+    .def("region_composition", &multem::MultiRegionMasker::region_composition)
     .def("set_rotation", &multem::MultiRegionMasker::set_rotation)
     .def("set_translation", &multem::MultiRegionMasker::set_translation)
     ;
@@ -1458,6 +1463,9 @@ PYBIND11_MODULE(multem_ext, m)
   // Region keys, the slice origin and the keyed random field (set_keyed_grf): engines without them
   // have none of these methods.
   multi_region_masker.attr("supports_keyed_grf") = py::bool_(true);
+  // set_region_composition: the interval composition of partial-volume fractions (the default), and the
+  // legacy one on request. Engines without it compose the legacy way only.
+  multi_region_masker.attr("supports_region_composition") = py::bool_(true);
 
   // Expose the simulation function
   //
@@ -1500,6 +1508,12 @@ PYBIND11_MODULE(multem_ext, m)
       "The mask the simulation computes for one slice (the engine's own dispatch), for tests.");
   m.def("convex_max_planes", []() { return multem::ConvexSet::MAX_PLANES; },
         "The most half-spaces one convex set (Masker.set_convex, outer or inner) may have.");
+  m.def(
+      "compute_region_fraction_engine",
+      &multem::compute_region_fraction_engine,
+      py::arg("masker"), py::arg("region"), py::arg("zs"), py::arg("ze"), py::arg("device") = false,
+      "One region's partial-volume fraction of a slice after its subtractions, as the simulation composes "
+      "it (the masker's region composition); for tests.");
   m.def(
       "compute_region_labels_engine",
       &multem::compute_region_labels_engine,

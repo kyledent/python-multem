@@ -1172,14 +1172,254 @@ namespace multem {
     }
 
     /**
-     * A region's partial-volume fraction with its subtracted regions taken off along the ray
-     * (nested children: f = max(f_self - sum f_child, 0)).
+     * A shape's part of a pixel column, for composing regions exactly: the z inside the shape at (x, y), as
+     * at most two intervals [z0, z1). Convex sets with an optional convex hole (kind 1), spheres (2) and
+     * cuboids (3), in the microscope frame. Cylinders are not covered (kind 0). fraction() is the shape's
+     * fraction of a slice exactly as masker_compute_fraction computes it, bit for bit.
+     */
+    struct ColumnShape {
+      int kind = 0;
+      double zmin = 0, zmax = 0;
+      ConvexPair pair;
+      double cx = 0, cy = 0, cz = 0, r2 = 0;
+      double e[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+      double lo[3] = {0, 0, 0}, hi[3] = {0, 0, 0};
+
+      DEVICE_CALLABLE double fraction(double x, double y, double zs, double ze) const {
+        if (kind == 1) return pair.fraction(x, y, zs, ze);
+        if (kind == 2) {
+          double dx = rn_add(x, -cx);
+          double dy = rn_add(y, -cy);
+          double h2 = rn_add(r2, -rn_add(rn_mul(dx, dx), rn_mul(dy, dy)));
+          if (!(h2 > 0)) return 0.0;
+          double h = sqrt(h2);
+          double a = rn_add(cz, -h);
+          double b = rn_add(cz, h);
+          a = a > zs ? a : zs;
+          b = b < ze ? b : ze;
+          return b > a ? rn_add(b, -a) / rn_add(ze, -zs) : 0.0;
+        }
+        if (kind == 3) {
+          double z0 = zs, z1 = ze;
+          if (!cuboid_clip(x, y, z0, z1)) return 0.0;
+          return z1 > z0 ? rn_add(z1, -z0) / rn_add(ze, -zs) : 0.0;
+        }
+        return 0.0;
+      }
+
+      // the cuboid's slab tests (as CuboidFractionSlice) narrowing [z0, z1]; false if a slab misses
+      DEVICE_CALLABLE bool cuboid_clip(double x, double y, double &z0, double &z1) const {
+        for (int k = 0; k < 3; ++k) {
+          double s = rn_add(rn_mul(e[k][0], x), rn_mul(e[k][1], y));
+          double g = e[k][2];
+          if (g == 0) {
+            if (!(s >= lo[k] && s < hi[k])) return false;
+          } else {
+            double a = rn_add(lo[k], -s) / g;
+            double b = rn_add(hi[k], -s) / g;
+            if (a > b) { double t = a; a = b; b = t; }
+            z0 = a > z0 ? a : z0;
+            z1 = b < z1 ? b : z1;
+          }
+        }
+        return true;
+      }
+
+      // the column's intervals inside the shape: their number (0, 1 or 2), as (z0, z1) pairs in z
+      DEVICE_CALLABLE int intervals(double x, double y, double *z) const {
+        if (kind == 1) {
+          double a0, a1;
+          if (!pair.outer.interval(x, y, a0, a1)) return 0;
+          if (pair.has_inner) {
+            double b0, b1;
+            if (pair.inner.interval(x, y, b0, b1)) {
+              double l = b0 > a0 ? b0 : a0;
+              double h = b1 < a1 ? b1 : a1;
+              if (h > l) {
+                int n = 0;
+                if (l > a0) { z[0] = a0; z[1] = l; n = 1; }
+                if (a1 > h) { z[2 * n] = h; z[2 * n + 1] = a1; ++n; }
+                return n;
+              }
+            }
+          }
+          z[0] = a0; z[1] = a1;
+          return 1;
+        }
+        if (kind == 2) {
+          double dx = rn_add(x, -cx);
+          double dy = rn_add(y, -cy);
+          double h2 = rn_add(r2, -rn_add(rn_mul(dx, dx), rn_mul(dy, dy)));
+          if (!(h2 > 0)) return 0;
+          double h = sqrt(h2);
+          z[0] = rn_add(cz, -h); z[1] = rn_add(cz, h);
+          return 1;
+        }
+        if (kind == 3) {
+          double z0 = -HUGE_VAL, z1 = HUGE_VAL;
+          if (!cuboid_clip(x, y, z0, z1) || !(z1 > z0)) return 0;
+          z[0] = z0; z[1] = z1;
+          return 1;
+        }
+        return 0;
+      }
+    };
+
+    inline ColumnShape column_shape(const Masker &m) {
+      ColumnShape c;
+      c.zmin = m.zmin();
+      c.zmax = m.zmax();
+      if (m.shape() == Masker::Convex) {
+        c.kind = 1;
+        c.pair = m.convex_masker().microscope();
+      } else if (m.shape() == Masker::Sphere) {
+        c.kind = 2;
+        const auto &s = m.sphere_masker();
+        const auto &ctr = s.centre_microscope();
+        c.cx = ctr[0]; c.cy = ctr[1]; c.cz = ctr[2];
+        c.r2 = s.radius() * s.radius();
+      } else if (m.shape() == Masker::Cuboid) {
+        c.kind = 3;
+        const auto &cm = m.cuboid_masker();
+        auto p1 = cm.points()[0];
+        auto q0 = cm.points()[1];
+        auto q1 = cm.points()[2];
+        auto q2 = cm.points()[3];
+        const std::array<double, 3> *q[3] = {&q0, &q1, &q2};
+        for (int k = 0; k < 3; ++k) {
+          for (int d = 0; d < 3; ++d) c.e[k][d] = (*q[k])[d] - p1[d];
+          double a = c.e[k][0] * p1[0] + c.e[k][1] * p1[1] + c.e[k][2] * p1[2];
+          double b = c.e[k][0] * (*q[k])[0] + c.e[k][1] * (*q[k])[1] + c.e[k][2] * (*q[k])[2];
+          c.lo[k] = a < b ? a : b;
+          c.hi[k] = a < b ? b : a;
+        }
+      }
+      return c;
+    }
+
+    inline std::vector<ColumnShape> column_shapes(const MultiRegionMasker &masker) {
+      std::vector<ColumnShape> out(masker.num_regions());
+      for (std::size_t i = 0; i < masker.num_regions(); ++i) out[i] = column_shape(masker.region(i).shape);
+      return out;
+    }
+
+    // The most subtracted regions a slice's interval composition takes, and the most pieces it keeps of a
+    // region's column (each subtracted interval adds at most one)
+    static const int COMPOSE_MAX_SUBS = 96;
+    static const int COMPOSE_MAX_PIECES = 16;
+
+    /**
+     * A region's fraction of [zs, ze) at each pixel: its own part of the column less the union of the
+     * subtracted regions' parts. Where no subtracted part meets the region's own, the region's fraction is
+     * returned as masker_compute_fraction gives it, bit for bit.
+     */
+    template <typename T>
+    struct IntervalComposition {
+      const ColumnShape *shapes;
+      int self;
+      int nsub;
+      int subs[COMPOSE_MAX_SUBS];
+      double zs, ze, pixel_size;
+      std::size_t ysize;
+
+      DEVICE_CALLABLE
+      T operator()(size_t index) const {
+        size_t i = index / ysize;
+        size_t j = index - i * ysize;
+        double x = rn_mul((double)i, pixel_size);
+        double y = rn_mul((double)j, pixel_size);
+        const ColumnShape &s = shapes[self];
+        double z[4];
+        int n = s.intervals(x, y, z);
+        double p[2 * COMPOSE_MAX_PIECES];
+        int np = 0;
+        for (int k = 0; k < n; ++k) {
+          double a = z[2 * k] > zs ? z[2 * k] : zs;
+          double b = z[2 * k + 1] < ze ? z[2 * k + 1] : ze;
+          if (b > a) { p[2 * np] = a; p[2 * np + 1] = b; ++np; }
+        }
+        if (np == 0) return T(0);
+        bool touched = false;
+        for (int q = 0; q < nsub && np > 0; ++q) {
+          double w[4];
+          int m = shapes[subs[q]].intervals(x, y, w);
+          for (int k = 0; k < m && np > 0; ++k) {
+            double u0 = w[2 * k], u1 = w[2 * k + 1];
+            double out[2 * COMPOSE_MAX_PIECES];
+            int no = 0;
+            for (int r = 0; r < np; ++r) {
+              double a = p[2 * r], b = p[2 * r + 1];
+              if (!(u1 > a && u0 < b)) {
+                out[2 * no] = a; out[2 * no + 1] = b; ++no;
+                continue;
+              }
+              touched = true;
+              if (u0 > a && no < COMPOSE_MAX_PIECES) { out[2 * no] = a; out[2 * no + 1] = u0; ++no; }
+              if (u1 < b && no < COMPOSE_MAX_PIECES) { out[2 * no] = u1; out[2 * no + 1] = b; ++no; }
+            }
+            for (int r = 0; r < 2 * no; ++r) p[r] = out[r];
+            np = no;
+          }
+        }
+        if (!touched) return T(s.fraction(x, y, zs, ze));
+        double length = 0.0;
+        for (int r = 0; r < np; ++r) length = rn_add(length, rn_add(p[2 * r + 1], -p[2 * r]));
+        return T(length / rn_add(ze, -zs));
+      }
+    };
+
+    /**
+     * The interval composition of one region for one slice, if it applies: every subtracted region that
+     * reaches the slice is a covered shape, and there are at most COMPOSE_MAX_SUBS of them. Returns false,
+     * leaving frac alone, if not.
+     */
+    template <typename FracVector>
+    bool compose_region_fraction(
+        const MultiRegionMasker &masker, std::size_t region_index, double zs, double ze,
+        const std::vector<ColumnShape> &host, const ColumnShape *shapes, FracVector &frac) {
+      using T = typename FracVector::value_type;
+      const ColumnShape &self = host[region_index];
+      if (self.kind == 0) return false;
+      if (!(zs < self.zmax && ze > self.zmin)) {
+        thrust::fill(frac.begin(), frac.end(), T(0));
+        return true;
+      }
+      IntervalComposition<T> f;
+      f.shapes = shapes;
+      f.self = (int)region_index;
+      f.nsub = 0;
+      f.zs = zs;
+      f.ze = ze;
+      f.pixel_size = masker.pixel_size();
+      f.ysize = masker.ysize();
+      for (int sub_idx : masker.region(region_index).subtract_regions) {
+        MULTEM_ASSERT(sub_idx >= 0 && sub_idx < (int)masker.num_regions());
+        const ColumnShape &c = host[sub_idx];
+        if (!(zs < c.zmax && ze > c.zmin)) continue;
+        if (c.kind == 0 || f.nsub == COMPOSE_MAX_SUBS) return false;
+        f.subs[f.nsub++] = sub_idx;
+      }
+      thrust::counting_iterator<size_t> indices(0);
+      thrust::transform(indices, indices + masker.image_size(), frac.begin(), f);
+      return true;
+    }
+
+    /**
+     * A region's partial-volume fraction with its subtracted regions taken off along the ray. With the
+     * masker's interval composition (the default) and column shapes given: the region's part of the
+     * column less the union of the subtracted parts (compose_region_fraction). Otherwise, or where that
+     * does not apply, the legacy composition f = max(f_self - sum f_sub, 0).
      */
     template <typename FracVector, typename BoolVector>
     void compute_region_fraction(
         const MultiRegionMasker &masker, std::size_t region_index, double zs, double ze, int n,
-        FracVector &frac, FracVector &scratch_frac, BoolVector &scratch_bool) {
+        FracVector &frac, FracVector &scratch_frac, BoolVector &scratch_bool,
+        const std::vector<ColumnShape> *host_shapes = nullptr, const ColumnShape *shapes = nullptr) {
       using T = typename FracVector::value_type;
+      if (masker.interval_composition() && host_shapes != nullptr && shapes != nullptr
+          && compose_region_fraction(masker, region_index, zs, ze, *host_shapes, shapes, frac)) {
+        return;
+      }
       const auto &region = masker.region(region_index);
       masker_compute_fraction(region.shape, zs, ze, n, frac, scratch_bool);
       for (int sub_idx : region.subtract_regions) {
@@ -2220,6 +2460,8 @@ namespace multem {
       mt::Vector<bool, DeviceType> scratch_mask_;  // for boolean SUBTRACT
       mt::Vector<T_r, DeviceType> scratch_fraction_;  // for partial-volume SUBTRACT
       mt::Vector<T_r, DeviceType> region_sum_;  // all regions' fields for this slice
+      std::vector<ColumnShape> columns_host_;  // each region's shape, for the interval composition
+      mt::Vector<ColumnShape, DeviceType> columns_;  // the same, where the fractions are computed
       std::vector<std::size_t> key_order_;  // region indices by ascending key (the keyed draw's sum order)
       bool keys_unique_ = true;
 
@@ -2234,6 +2476,8 @@ namespace multem {
 
       void set_masker(const MultiRegionMasker &masker) {
         masker_ = masker;
+        columns_host_ = column_shapes(masker);
+        columns_.assign(columns_host_.begin(), columns_host_.end());
         regions_.resize(masker.num_regions());
         for (std::size_t i = 0; i < masker.num_regions(); ++i) {
           regions_[i].set_from_ice_parameters(masker.region(i).material);
@@ -2580,7 +2824,8 @@ namespace multem {
           // Compute mask with boolean subtraction (or the partial-volume fraction)
           if (masker_.partial_volume() > 0) {
             compute_region_fraction(masker_, i, z_0, z_e, masker_.partial_volume(),
-                                    reg.fraction, scratch_fraction_, scratch_mask_);
+                                    reg.fraction, scratch_fraction_, scratch_mask_,
+                                    &columns_host_, thrust::raw_pointer_cast(columns_.data()));
           } else {
             compute_region_mask(masker_, i, z_0, z_e, reg.mask, scratch_mask_);
           }
@@ -3791,6 +4036,38 @@ namespace multem {
       mt::Vector<double, mt::e_host> f(masker.image_size());
       mt::Vector<bool, mt::e_host> b(masker.image_size());
       detail::masker_compute_fraction(masker, zs, ze, samples, f, b);
+      std::copy(f.begin(), f.end(), out.begin());
+    }
+    return out;
+  }
+
+  std::vector<double> compute_region_fraction_engine(
+      const MultiRegionMasker &masker, int region, double zs, double ze, bool device) {
+    // one region's partial-volume fraction after its subtractions, as the simulation composes it (in
+    // double precision; the simulation stores it in its own precision)
+    MULTEM_ASSERT(region >= 0 && region < (int)masker.num_regions());
+    MULTEM_ASSERT(masker.partial_volume() > 0);
+    std::size_t n = masker.image_size();
+    std::vector<double> out(n);
+    std::vector<detail::ColumnShape> host = detail::column_shapes(masker);
+    if (device) {
+#ifndef MULTEM_NO_CUDA
+      mt::Vector<detail::ColumnShape, mt::e_device> shapes(host.begin(), host.end());
+      mt::Vector<double, mt::e_device> f(n), g(n);
+      mt::Vector<bool, mt::e_device> b(n);
+      detail::compute_region_fraction(masker, region, zs, ze, masker.partial_volume(), f, g, b, &host,
+                                      thrust::raw_pointer_cast(shapes.data()));
+      mt::Vector<double, mt::e_host> h(f.size());
+      thrust::copy(f.begin(), f.end(), h.begin());
+      std::copy(h.begin(), h.end(), out.begin());
+#else
+      MULTEM_ASSERT(!device);
+#endif
+    } else {
+      mt::Vector<double, mt::e_host> f(n), g(n);
+      mt::Vector<bool, mt::e_host> b(n);
+      detail::compute_region_fraction(masker, region, zs, ze, masker.partial_volume(), f, g, b, &host,
+                                      host.data());
       std::copy(f.begin(), f.end(), out.begin());
     }
     return out;
